@@ -9,6 +9,10 @@
  * only use one comm_handle
  */
 
+/*
+ * TODO: Use newer libevent library
+ */
+
 /* 
  * XXX: Endpoint doesn't seem to need to detect health of system. Does it?
  */
@@ -237,6 +241,10 @@ void ep_list_free(void *arg)
 /* Initialize the host. Return negative code on error */
 static int host_init(comm_handle_t *handle)
 {
+	/* 
+	 * TODO: EP might come up later than host, so might be good idea
+	 * to wait for some time and then retry upto some limit
+	 */
 
 	/* Create a pipe to comm with the new thread being spawned */
 	int i, j, ret, pipefd[2];

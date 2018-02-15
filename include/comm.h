@@ -59,7 +59,7 @@ typedef struct {
 
 
 /* Callback function called by comm module for ep when host sends data */
-typedef int (*comm_ep_callback_t)(int host_num, char *buf, int len);
+typedef void (*comm_ep_callback_t)(int host_num, char *buf, int len);
 
 /* Data kept around in host (per ep) */
 typedef struct {
