@@ -15,11 +15,11 @@ int main(void)
 {
 	comm_handle_t handle;
 
+	printf("Endpoint starting\n");
+
 	comm_init(&handle, callback);
 	
-	printf("Endpoint started: Will wait forever\n");
-	
-	while(1);
+	printf("Endpoint ended\n");
 
 	return 0;
 }

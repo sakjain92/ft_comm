@@ -4,7 +4,7 @@ SDIR=src
 TDIR=test
 
 CC=gcc
-CFLAGS= -Wall -Wextra -I$(IDIR)
+CFLAGS= -Wall -Wextra -I$(IDIR) -g3
 LDFLAGS=-L./ -L./libevent-release-1.4.15-stable/.libs
 
 COMM_LIB_NAME =comm

@@ -11,6 +11,11 @@
 
 /*
  * TODO: Use newer libevent library
+ * TODO: Seperate initialization and looping for ep
+ * TODO: When can't send data (because of any error), stop the connection
+ * TODO: Essentially RPC, But data representation needs to be independent of
+ * machine types (RPI and Intel - differences?)
+ * FIXME: If no connections on host established with eps, need to fail
  */
 
 /* 
@@ -171,16 +176,23 @@ static void host_incoming_data(int fd, short ev, void *arg)
 
 	for (i = 0; i < NUM_EPS; i++) {
 		for (j = 0; j < NUM_SWITCHES; j++) {
-			
+
+			int is_empty;
+
 			host_data_t *host_data = &handle->host_data[i][j];
 			
+			if (!host_data->is_connected)
+				continue;
+
+			is_empty = list_size(&host_data->comm_data_list) == 0;
+
 			ret = list_append(&host_data->comm_data_list, (void *)data);
 			if (ret == false) {
 				warn("Warning: Couldn't send data to ep: %d", i);
 				continue;
 			}
 
-			if (list_size(&host_data->comm_data_list) == 0) {
+			if (is_empty) {
 				event_add(&host_data->ev_write, NULL);
 			}
 
@@ -203,28 +215,36 @@ static void host_send_to_ep(int fd, short ev, void *arg)
 	data = list_pop_head(&host_data->comm_data_list);
 	assert(data != NULL);
 
-	if (list_size(&host_data->comm_data_list) == 0) {
-		event_del(&host_data->ev_write);
-	}
-
 	memcpy(comm_data.buf, data->buf, data->len);
 	comm_data.msg_len = data->len;
 	comm_data.msg_type = MSG_DATA;
 
-	ret = write(fd, comm_data.buf, sizeof(comm_data_t));
-	if (ret < 0) {
-		warn("Warning: Couldn't send data to ep");
-	}
-
-	if (ret != sizeof(comm_data_t)) {
-		warn("Warning: Sent corrupted data packet to ep");
-	}
-
+	ret = write(fd, (char *)&comm_data, sizeof(comm_data_t));
+	
 	data->ref--;
 
 	if (data->ref == 0)
 		free(data);
 
+	if (ret < 0) {
+		warn("Warning: Couldn't send data to ep");
+		host_data->is_connected = false;
+		goto err;
+	}
+
+	if (ret != sizeof(comm_data_t)) {
+		warn("Warning: Sent corrupted data packet to ep");
+		goto err;
+	}
+
+	if (list_size(&host_data->comm_data_list) == 0) {
+		event_del(&host_data->ev_write);
+	}
+
+	return;
+err:
+	host_data->is_connected = false;
+	event_del(&host_data->ev_write);
 }
 
 
@@ -271,6 +291,7 @@ static int host_init(comm_handle_t *handle)
 		for (j = 0; j < NUM_SWITCHES; j++) {
 			handle->host_data[i][j].ep_num = i;
 			handle->host_data[i][j].ep_fd = -1;
+			handle->host_data[i][j].is_connected = false;
 			list_new(&handle->host_data[i][j].comm_data_list,
 					ep_list_free);
 		}
@@ -322,6 +343,8 @@ static int host_init(comm_handle_t *handle)
 			event_set(&handle->host_data[i][j].ev_write, *sockfd,
 					EV_WRITE|EV_PERSIST, host_send_to_ep, 
 					&handle->host_data[i][j]);
+
+			handle->host_data[i][j].is_connected = true;
 
 			/* Not adding event here, wait for any data to come first */
 
@@ -404,7 +427,7 @@ void ep_read(int fd, short ev, void *arg)
 
 	} else if (len < 0) {
 		/* Some other error occurred */
-		warn("Warning: Socket failure, disconnecting host: %d\n",
+		warn("Warning: Socket failure, disconnecting host: %d",
 			ep_data->host_num);
 		close(fd);
 		event_del(&ep_data->ev_read);
@@ -427,7 +450,7 @@ void ep_read(int fd, short ev, void *arg)
 
 		return;
 
-	} else if (comm_data.msg_type == MSG_HEARTBEAT_RESP) {
+	} else if (comm_data.msg_type == MSG_DATA) {
 		/* Call the callback indicating reception of data */
 		ep_data->ep_handle->ep_callback(ep_data->host_num,
 						 comm_data.buf,
@@ -592,7 +615,7 @@ static int ep_init(comm_handle_t *handle)
 	 */
 	event_set(&ev_accept, fd, EV_READ|EV_PERSIST, ep_accept, handle);
 	event_add(&ev_accept, NULL);
-                                                                                                                                                                                                                                   
+
 	/* Start the libevent event loop. */
 	event_dispatch();
 
@@ -611,7 +634,7 @@ int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 	handle->ep_callback = ep_callback;
 
 	if (handle->is_host) {
-		
+
 		if (ep_callback != NULL) {
 			warn("Error: Callback mentioned for a host node");
 			return -EINVAL;

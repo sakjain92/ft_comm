@@ -65,6 +65,7 @@ typedef void (*comm_ep_callback_t)(int host_num, char *buf, int len);
 typedef struct {
 	int ep_num;
 	int ep_fd;		/* FD for writing to ep */
+	bool is_connected;
 	list_t comm_data_list;	/* List of pending data to be sent */ 
 	struct event ev_write;
 } host_data_t;

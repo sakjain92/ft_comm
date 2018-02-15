@@ -95,8 +95,9 @@ void *list_pop_head(list_t *list)
 	if (list->len == 0)
 		return NULL;
 
-	data = list->head;
+	data = list->head->data;
 	list->head = list->head->next;
+	list->len--;
 
 	return data;
 }

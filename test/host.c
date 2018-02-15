@@ -15,7 +15,8 @@ int main()
 
 	for (i = 0; i < 10; i++) {
 		sleep(1);
-		sprintf(buf, "Sending message %d/10", i + 1);
+		sprintf(buf, "Hello! Message (%d/10) from host", i + 1);
+		printf("Sending message %d of len %zu\n", i + 1, strlen(buf));
 		host_send_msg(&handle, buf, strlen(buf) + 1);
 	}
 
