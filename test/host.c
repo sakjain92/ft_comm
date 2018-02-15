@@ -15,7 +15,7 @@ int main()
 
 	for (i = 0; i < 10; i++) {
 		sleep(1);
-		sprintf(buf, "Message %d/10", i + 1);
+		sprintf(buf, "Sending message %d/10", i + 1);
 		host_send_msg(&handle, buf, strlen(buf) + 1);
 	}
 

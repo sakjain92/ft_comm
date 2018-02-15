@@ -10,7 +10,7 @@ LDFLAGS=-L./ -L./libevent-release-1.4.15-stable/.libs
 COMM_LIB_NAME =comm
 COMM_LIB = lib$(COMM_LIB_NAME).a
 
-LIBS = -l$(COMM_LIB_NAME) -levent -lrt -pthread 
+LIBS = -l$(COMM_LIB_NAME) -Wl,-Bstatic -levent -Wl,-Bdynamic -lrt -pthread 
 _DEPS = list.h comm.h
 DEPS = $(patsubst %,$(IDIR)/%,$(_DEPS))
 
