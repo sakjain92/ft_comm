@@ -52,7 +52,8 @@
 #include "comm.h"
 
 /* Libeevent */
-#include <event.h>
+#include <event2/thread.h>
+#include <event2/event.h>
 
 /* In host, need a seperate thread for event loop */
 #include <pthread.h>
@@ -154,9 +155,9 @@ int host_send_msg(comm_handle_t *handle, char *buf, size_t len)
 /* Runs the event loop in seperate thread */
 static void *host_event_loop(void *arg)
 {
-	(void)arg;
+	comm_handle_t *handle = (comm_handle_t *)arg;
 
-	event_dispatch();
+	event_base_dispatch(handle->ev_base);
 
 	/* Should never return */
 	assert(0);
@@ -207,7 +208,7 @@ static void host_incoming_data(int fd, short ev, void *arg)
 			}
 
 			if (is_empty) {
-				event_add(&host_data->ev_write, NULL);
+				event_add(host_data->ev_write, NULL);
 			}
 
 			data->ref++;
@@ -253,13 +254,14 @@ static void host_send_to_ep(int fd, short ev, void *arg)
 	}
 
 	if (list_size(&host_data->comm_data_list) == 0) {
-		event_del(&host_data->ev_write);
+		event_del(host_data->ev_write);
 	}
 
 	return;
 err:
 	host_data->is_connected = false;
-	event_del(&host_data->ev_write);
+	event_del(host_data->ev_write);
+	event_free(host_data->ev_write);
 }
 
 
@@ -296,10 +298,11 @@ static int host_init(comm_handle_t *handle)
 	if (ret < 0)
 		goto nb_err;
 
-	event_set(&handle->ev_outstanding_data, pipefd[0],
-			EV_READ|EV_PERSIST, host_incoming_data, handle);
+	handle->ev_outstanding_data = event_new(handle->ev_base, pipefd[0],
+						EV_READ | EV_PERSIST,
+						host_incoming_data, handle);
 
-	event_add(&handle->ev_outstanding_data, NULL);
+	event_add(handle->ev_outstanding_data, NULL);
 
 	/* Initialization */
 	for (i = 0; i < NUM_EPS; i++) {
@@ -355,9 +358,10 @@ static int host_init(comm_handle_t *handle)
 				continue;
 			}
 
-			event_set(&handle->host_data[i][j].ev_write, *sockfd,
-					EV_WRITE|EV_PERSIST, host_send_to_ep, 
-					&handle->host_data[i][j]);
+			handle->host_data[i][j].ev_write =
+				event_new(handle->ev_base, *sockfd,
+						EV_WRITE|EV_PERSIST, host_send_to_ep, 
+						&handle->host_data[i][j]);
 
 			handle->host_data[i][j].is_connected = true;
 
@@ -421,6 +425,7 @@ void ep_write(int fd, short ev, void *arg)
 void ep_read(int fd, short ev, void *arg)
 {
 	ep_data_t *ep_data = (ep_data_t *)arg;
+	comm_handle_t *handle = ep_data->ep_handle;
 	comm_data_t comm_data;
 	size_t min_len;
 	ssize_t len;
@@ -436,7 +441,8 @@ void ep_read(int fd, short ev, void *arg)
 		fprintf(stderr, "Warning: Host connection terminated: %d\n",
 			ep_data->host_num);
                 close(fd);
-		event_del(&ep_data->ev_read);
+		event_del(ep_data->ev_read);
+		event_free(ep_data->ev_read);
 		free(ep_data);
 		return;
 
@@ -445,23 +451,24 @@ void ep_read(int fd, short ev, void *arg)
 		warn("Warning: Socket failure, disconnecting host: %d",
 			ep_data->host_num);
 		close(fd);
-		event_del(&ep_data->ev_read);
+		event_del(ep_data->ev_read);
+		event_free(ep_data->ev_read);
 		free(ep_data);
 		return;
 	} else if ((size_t)len < min_len) {
 		warn("Warning: Invalid packet data");
 		return;
 	}
-       
+
 	if (comm_data.msg_type == MSG_HEARTBEAT_REQ) {
 
 		assert(comm_data.msg_len == 0);
 
 		/* Send the heartbeat when ready */
-		event_set(&ep_data->ev_write, fd, EV_WRITE, ep_write, 
-	    			ep_data);
+		ep_data->ev_write = event_new(handle->ev_base, fd, EV_WRITE,
+						ep_write, ep_data);
 
-		event_add(&ep_data->ev_write, NULL);
+		event_add(ep_data->ev_write, NULL);
 
 		return;
 
@@ -547,10 +554,11 @@ static void ep_accept(int fd, short ev, void *arg)
 	 * read event persistent so we don't have to re-add after each
 	 * read. 
 	 */
-	event_set(&ep_data->ev_read, hfd, EV_READ|EV_PERSIST, ep_read, 
-	    		ep_data);
+	ep_data->ev_read = event_new(ep_data->ep_handle->ev_base,
+					hfd, EV_READ|EV_PERSIST, ep_read, 
+	    				ep_data);
 
-	event_add(&ep_data->ev_read, NULL);
+	event_add(ep_data->ev_read, NULL);
 
 	return;
 
@@ -566,7 +574,6 @@ static int ep_init(comm_handle_t *handle)
 	int optval; /* flag value for setsockopt */
 	struct sockaddr_in epaddr; /* ep's addr */
 	int ret;
-	struct event ev_accept;
 	
 	/*
 	 * Setup a port, start listening on it and call the callback whenever
@@ -628,11 +635,14 @@ static int ep_init(comm_handle_t *handle)
 	 * We now have a listening socket, we create a read event to
 	 * be notified when a host connects
 	 */
-	event_set(&ev_accept, fd, EV_READ|EV_PERSIST, ep_accept, handle);
-	event_add(&ev_accept, NULL);
+	handle->ev_accept = event_new(handle->ev_base, fd,
+					EV_READ | EV_PERSIST,
+					ep_accept, handle);
+	
+	event_add(handle->ev_accept, NULL);
 
 	/* Start the libevent event loop. */
-	event_dispatch();
+	event_base_dispatch(handle->ev_base);
 
 err:
 	close(fd);
@@ -643,7 +653,11 @@ err:
 int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 {
 	/* Initialize the event lib */
-	event_init();
+	int ret = evthread_use_pthreads();
+	if (ret < 0 || (handle->ev_base = event_base_new()) == NULL) {
+		fprintf(stderr, "Error: Libevent initialization failed\n");
+		return -EINVAL;
+	}
 
 	handle->is_host = is_node_host();
 	handle->ep_callback = ep_callback;

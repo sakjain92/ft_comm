@@ -5,12 +5,12 @@ TDIR=test
 
 CC=gcc
 CFLAGS= -Wall -Wextra -I$(IDIR) -g3
-LDFLAGS=-L./ -L./libevent-release-1.4.15-stable/.libs
+LDFLAGS=-L./
 
 COMM_LIB_NAME =comm
 COMM_LIB = lib$(COMM_LIB_NAME).a
 
-LIBS = -l$(COMM_LIB_NAME) -Wl,-Bstatic -levent -Wl,-Bdynamic -lrt -pthread 
+LIBS = -l$(COMM_LIB_NAME) -levent_core -levent_extra -levent_pthreads -lrt -pthread 
 _DEPS = list.h comm.h
 DEPS = $(patsubst %,$(IDIR)/%,$(_DEPS))
 

@@ -21,5 +21,6 @@ int main()
 	}
 
 	printf("Host ended\n");
+	while(1);
 	return 0;
 }

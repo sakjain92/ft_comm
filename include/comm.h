@@ -67,18 +67,21 @@ typedef struct {
 	int ep_fd;		/* FD for writing to ep */
 	bool is_connected;
 	list_t comm_data_list;	/* List of pending data to be sent */ 
-	struct event ev_write;
+	struct event *ev_write;
 } host_data_t;
 
 /* Handle to the state of comm module */
 typedef struct {
 	bool is_host;
 
+	struct event_base *ev_base;
+
 	pthread_t host_event_thread;
 	int host_write_fd;			/* Write to this pipe initiates writes to eps */
 	host_data_t host_data[NUM_EPS][NUM_SWITCHES];
-	struct event ev_outstanding_data;	/* Event for incoming data to send out */
+	struct event *ev_outstanding_data;	/* Event for incoming data to send out */
 	
+	struct event *ev_accept;
 	comm_ep_callback_t ep_callback;		/* Callback for ep when data arrives */
 
 } comm_handle_t;
@@ -86,8 +89,8 @@ typedef struct {
 /* Data kept around in ep (per host) */
 typedef struct {
 	int host_num;
-	struct event ev_read;
-	struct event ev_write;
+	struct event *ev_read;
+	struct event *ev_write;
 	comm_handle_t *ep_handle;
 } ep_data_t;
 
@@ -99,9 +102,10 @@ typedef struct {
 } pending_data_t;
 
 /* Different types of messages */
-#define MSG_HEARTBEAT_REQ	0
-#define MSG_HEARTBEAT_RESP	1
-#define MSG_DATA		2
+#define MSG_INVALID_TYPE	0
+#define MSG_HEARTBEAT_REQ	1
+#define MSG_HEARTBEAT_RESP	2
+#define MSG_DATA		3
 
 /* The communication format - Don't change the order*/
 typedef struct {
