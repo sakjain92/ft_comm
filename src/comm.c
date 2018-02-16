@@ -29,6 +29,7 @@
  * TODO: Break down API into host and ep (seperate)
  * TODO: Support corrupted packets detection? MD5?
  * TODO: Use buffered ev and new libevent library
+ * TODO: Error handling of libevent
  */
 
 /* 
@@ -54,6 +55,7 @@
 /* Libeevent */
 #include <event2/thread.h>
 #include <event2/event.h>
+#include <event2/bufferevent.h>
 
 /* In host, need a seperate thread for event loop */
 #include <pthread.h>
@@ -131,23 +133,42 @@ static int get_ip_addr(struct sockaddr_storage *addr, char *dest_ip, int dest_le
 int host_send_msg(comm_handle_t *handle, char *buf, size_t len)
 {
 	/* Write to write end of pipe */
-	ssize_t ret;
+	comm_data_t *data;
+
+	if (len == 0) {
+		warn("WARNING: Doesn't support sending empty packets");
+		return -EINVAL;
+	}
 
 	if (len > MAX_DATA_LEN) {
 		warn("WARNING: Data too long to send: %zu", len);
 		return -EINVAL;
 	}
 
-	ret = write(handle->host_write_fd, buf, len);
-	if (ret < 0) {
-		warn("WARNING: Couldn't write data to pipe");
-		return ret;
+	/* Read data */
+	data = malloc(sizeof(comm_data_t));
+	if (data == NULL) {
+		fprintf(stderr, "WARNING: Out of memory");
+		return -ENOMEM;
 	}
-	
-	if ((size_t)ret != len) {
-		warn("WARNING: Couldn't write the whole data");
-		return -EINVAL;
+
+	memcpy(data->buf, buf, len);
+	data->msg_len = len;
+	data->msg_type = MSG_DATA;
+
+	pthread_mutex_lock(&handle->lock);
+
+	if (list_append(&handle->data_list, data) != true) {
+		free(data);
+		fprintf(stderr, "WARNING: Couldn't add to list");
+		pthread_mutex_unlock(&handle->lock);
+		return -ENOMEM;
 	}
+
+	pthread_mutex_unlock(&handle->lock);
+
+	/* Write dummy char - Just a trigger */
+	bufferevent_write(handle->host_write, DUMMY_TRIGGER_VAL , 1);
 
 	return 0;
 }
@@ -160,119 +181,100 @@ static void *host_event_loop(void *arg)
 	event_base_dispatch(handle->ev_base);
 
 	/* Should never return */
+	/* FIXME: The loop will quite currently if connection terminates */
 	assert(0);
 
 	return NULL;
 }
 
 /* Prepares incoming data from host to be sent to eps */
-static void host_incoming_data(int fd, short ev, void *arg)
+static void host_incoming_data(struct bufferevent *bev, void *arg)
 {
 	comm_handle_t *handle = (comm_handle_t *)arg;
-	pending_data_t *data;
-	int i, j, ret;
+	comm_data_t *data;
+	int i, j, ret, len;
+	char ch;
 
-	(void)ev;
+	while (1) {
 
-	/* Read data */
-	data = malloc(sizeof(pending_data_t));
-	if (data == NULL) {
-		warn("WARNING: Out of memory");
-		return;
-	}
+		ret = bufferevent_read(bev, &ch, 1);
+		if (ret == 0)
+			return;
 
-	ret = read(fd, data->buf, sizeof(data->buf));
-	if (ret < 0) {
-		warn("WARNING: Couldn't read from pipe");
-	}
+		assert(ch == DUMMY_TRIGGER_VAL[0]);
 
-	data->len = ret;
-	data->ref = 0;
 
-	for (i = 0; i < NUM_EPS; i++) {
-		for (j = 0; j < NUM_SWITCHES; j++) {
+		pthread_mutex_lock(&handle->lock);
+		data = list_pop_head(&handle->data_list);
+		assert(data != NULL);
+		pthread_mutex_unlock(&handle->lock);
 
-			int is_empty;
-
-			host_data_t *host_data = &handle->host_data[i][j];
-			
-			if (!host_data->is_connected)
-				continue;
-
-			is_empty = list_size(&host_data->comm_data_list) == 0;
-
-			ret = list_append(&host_data->comm_data_list, (void *)data);
-			if (ret == false) {
-				warn("Warning: Couldn't send data to ep: %d", i);
-				continue;
-			}
-
-			if (is_empty) {
-				event_add(host_data->ev_write, NULL);
-			}
-
-			data->ref++;
-		}
-	}
+		for (i = 0; i < NUM_EPS; i++) {
+			for (j = 0; j < NUM_SWITCHES; j++) {
 	
+				host_data_t *host_data = &handle->host_data[i][j];
+				
+				if (!host_data->is_connected)
+					continue;
+
+				len = (uintptr_t)&data->buf[data->msg_len] -
+					(uintptr_t)data;
+
+				ret = bufferevent_write(host_data->bev_write,
+							(char *)data, len);
+
+				if (ret < 0) {
+					fprintf(stderr, 
+						"WARNING: Sent corrupt data to %d\n",
+						host_data->ep_num);
+					host_data->is_connected = false;
+					bufferevent_free(host_data->bev_write);
+				}
+			}
+		}
+
+		free(data);
+	}	
 }
 
-/* Send pending data to ep */
-static void host_send_to_ep(int fd, short ev, void *arg)
+/* Called when host gets heartbeats */
+static void host_got_heartbeat(struct bufferevent *bev, void *arg)
 {
-	host_data_t *host_data = (host_data_t *)arg;
-	pending_data_t *data;
-	comm_data_t comm_data;
-	int ret;
-
-	(void)ev;
-
-	data = list_pop_head(&host_data->comm_data_list);
-	assert(data != NULL);
-
-	memcpy(comm_data.buf, data->buf, data->len);
-	comm_data.msg_len = data->len;
-	comm_data.msg_type = MSG_DATA;
-
-	/* Ignore Sigpipe */
-	ret = send(fd, (char *)&comm_data, sizeof(comm_data_t), MSG_NOSIGNAL);
-	
-	data->ref--;
-
-	if (data->ref == 0)
-		free(data);
-
-	if (ret < 0) {
-		warn("Warning: Couldn't send data to ep");
-		host_data->is_connected = false;
-		goto err;
-	}
-
-	if (ret != sizeof(comm_data_t)) {
-		warn("Warning: Sent corrupted data packet to ep");
-		goto err;
-	}
-
-	if (list_size(&host_data->comm_data_list) == 0) {
-		event_del(host_data->ev_write);
-	}
-
-	return;
-err:
-	host_data->is_connected = false;
-	event_del(host_data->ev_write);
-	event_free(host_data->ev_write);
+	(void)bev;
+	(void)arg;
 }
 
 
 /* Function used by list package to free up data when deleting list */
-void ep_list_free(void *arg)
+static void data_free_fn(void *arg)
 {
-	pending_data_t *data = (pending_data_t *)arg;
+	comm_data_t *data = (comm_data_t *)arg;
+	free(data);
+}
 
-	data->ref--;
-	if (data->ref == 0)
-		free(data);
+/*
+ * This function is called on any error while host is writing to ep
+ */
+void host_event(struct bufferevent *bev, short event, void *arg)
+{
+	host_data_t *host_data = (host_data_t *)arg;
+
+    	if (event & BEV_EVENT_EOF) {
+		/* EP disconnected */
+		fprintf(stderr, "Warning: EP connection terminated: %d\n",
+			host_data->ep_num);
+
+	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING) {
+		/* Some other error occurred */
+		warn("Warning: Socket failure, disconnecting ep: %d",
+			host_data->ep_num);
+	} else {
+		warn("Warning: Unknown error on socket, disconnecting host: %d",
+			host_data->ep_num);
+	} 
+
+	bufferevent_free(bev);
+	return;
 }
 
 /* Initialize the host. Return negative code on error */
@@ -284,34 +286,28 @@ static int host_init(comm_handle_t *handle)
 	 */
 
 	/* Create a pipe to comm with the new thread being spawned */
-	int i, j, ret, pipefd[2];
+	int i, j, ret;
+	struct bufferevent *pair[2];
 
-	ret = pipe(pipefd);
+	ret = bufferevent_pair_new(handle->ev_base, BEV_OPT_CLOSE_ON_FREE, pair);
 	if (ret < 0) {
 		warn("ERROR: Couldn't open pipes: %d", ret);
 		return ret;
 	}
 
-	handle->host_write_fd = pipefd[1]; /* Write end of pipe */
+	handle->host_write = pair[1]; /* Write end of pipe */
+	handle->ev_outstanding = pair[0];
 
-	ret = set_nonblock(pipefd[0]); /* Read end */
-	if (ret < 0)
-		goto nb_err;
+	bufferevent_setcb(handle->ev_outstanding, host_incoming_data, NULL, NULL,
+			  handle);
 
-	handle->ev_outstanding_data = event_new(handle->ev_base, pipefd[0],
-						EV_READ | EV_PERSIST,
-						host_incoming_data, handle);
-
-	event_add(handle->ev_outstanding_data, NULL);
+	bufferevent_enable(handle->ev_outstanding, EV_READ);
 
 	/* Initialization */
 	for (i = 0; i < NUM_EPS; i++) {
 		for (j = 0; j < NUM_SWITCHES; j++) {
 			handle->host_data[i][j].ep_num = i;
-			handle->host_data[i][j].ep_fd = -1;
 			handle->host_data[i][j].is_connected = false;
-			list_new(&handle->host_data[i][j].comm_data_list,
-					ep_list_free);
 		}
 	}
 
@@ -321,11 +317,11 @@ static int host_init(comm_handle_t *handle)
 
 			struct hostent *server;
 			struct sockaddr_in serveraddr;
-			int *sockfd = &handle->host_data[i][j].ep_fd;
+			int sockfd;
 			char *ep_name = eps[i].ip[j];
 				
-	    		*sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    			if (*sockfd < 0) {
+	    		sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    			if (sockfd < 0) {
         			warn("WARNING: Couldn't open socket with ep %s",
 					ep_name);
 				continue;
@@ -334,8 +330,8 @@ static int host_init(comm_handle_t *handle)
 			server = gethostbyname(ep_name);
 			if (server == NULL) {
 				warn("WARNING: Issue in EPs ipaddr: %s", ep_name);
-				close(*sockfd);
-				*sockfd = -1;
+				close(sockfd);
+				sockfd = -1;
 				continue;
 			}
 
@@ -348,143 +344,205 @@ static int host_init(comm_handle_t *handle)
 			serveraddr.sin_port = htons((unsigned short)EP_LISTEN_PORT);
 
 			/* connect: create a connection with the server */
-    			ret = connect(*sockfd, (struct sockaddr *)&serveraddr,
+    			ret = connect(sockfd, (struct sockaddr *)&serveraddr,
 					sizeof(serveraddr));
 			if (ret < 0) { 
       				warn("WARNING: Couldn't connect to ep: %s",
 						ep_name);
-				*sockfd = -1;
-				close(*sockfd);
+				sockfd = -1;
+				close(sockfd);
 				continue;
 			}
 
-			handle->host_data[i][j].ev_write =
-				event_new(handle->ev_base, *sockfd,
-						EV_WRITE|EV_PERSIST, host_send_to_ep, 
-						&handle->host_data[i][j]);
+			handle->host_data[i][j].bev_write =
+				bufferevent_socket_new(handle->ev_base, sockfd,
+							BEV_OPT_CLOSE_ON_FREE);
 
 			handle->host_data[i][j].is_connected = true;
+			
+			bufferevent_setcb(handle->host_data[i][j].bev_write,
+						host_got_heartbeat,
+						NULL,
+						host_event,
+						&handle->host_data[i][j]);
 
-			/* Not adding event here, wait for any data to come first */
-
-
+			bufferevent_enable(handle->host_data[i][j].bev_write,
+						EV_READ | EV_WRITE);
 		}
+	}
+
+	list_new(&handle->data_list, data_free_fn);
+
+	ret = pthread_mutex_init(&handle->lock, NULL);
+	if (ret < 0) {
+		printf("ERROR: Mutex init failed\n");
+		goto sock_err;
 	}
 
 	/* start a new thread that will handle the event loop */
 	ret = pthread_create(&handle->host_event_thread, NULL,
-			host_event_loop, (void *)handle);
+				host_event_loop, (void *)handle);
 	if (ret < 0) {
 		warn("ERROR: Couldn't start a new event handler thread: %d", ret);
-		goto sock_err;
+		goto thread_err;
 	}
 
 	return 0;
 
+thread_err:
+	pthread_mutex_destroy(&handle->lock);
+
 sock_err:
 	for (i = 0; i < NUM_EPS; i++) {
 		for (j = 0; j < NUM_SWITCHES; j++) {
-			if (handle->host_data[i][j].ep_fd == -1)
+			if (handle->host_data[i][j].is_connected == false)
 				continue;
-			close(handle->host_data[i][j].ep_fd);
+			bufferevent_free(handle->host_data[i][j].bev_write);
 		}
 	}
-nb_err:
-	close(pipefd[0]);
-	close(pipefd[1]);
+
+	bufferevent_free(handle->ev_outstanding);
+	bufferevent_free(handle->host_write);
 	return ret;
 }
 
 /*
- * This function will be called by libevent when there is a pending heartbeat to
- * be sent by the end point
+ * This function is called on any error while ep is reading/writing
  */
-void ep_write(int fd, short ev, void *arg)
+void ep_event(struct bufferevent *bev, short event, void *arg)
 {
-	comm_data_t comm_data;
-	size_t len, wlen;
 	ep_data_t *ep_data = (ep_data_t *)arg;
 
-	(void)ev;
+    	if (event & BEV_EVENT_EOF) {
+		/* Host disconnected */
+		fprintf(stderr, "Warning: Host connection terminated: %d\n",
+			ep_data->host_num);
 
-	comm_data.msg_type = MSG_HEARTBEAT_RESP;
-	comm_data.msg_len = 0;
+	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING ||
+			event & BEV_EVENT_READING) {
+		/* Some other error occurred */
+		warn("Warning: Socket failure, disconnecting host: %d",
+			ep_data->host_num);
+	} else {
+		warn("Warning: Unknown error on socket, disconnecting host: %d",
+			ep_data->host_num);
+	} 
 
-	len = (uintptr_t)&comm_data.buf[0] - (uintptr_t)&comm_data;
-	wlen = write(fd, (char *)&comm_data, len);
+	bufferevent_free(bev);
+	free(ep_data);
+	return;
+}
 
-        if (wlen < len) {
-		warn("Warning: Couldn't send heartbeat: %d", ep_data->host_num);
-	}	
+/*
+ * This function will be called by libevent after heartbeat is sent to host
+ */
+void ep_write(struct bufferevent *bev, void *arg)
+{
+	(void)bev;
+	(void)arg;
 }
 
 /*
  * This function will be called by libevent when there is a pending data to
  * be read by end point on existing connection
  */
-void ep_read(int fd, short ev, void *arg)
+void ep_read(struct bufferevent *bev, void *arg)
 {
 	ep_data_t *ep_data = (ep_data_t *)arg;
 	comm_handle_t *handle = ep_data->ep_handle;
-	comm_data_t comm_data;
-	size_t min_len;
-	ssize_t len;
+	ssize_t len, req_len;
+	int is_metadata;
 
-	(void)ev;
+	while (1) {
 
-	/* We need atleast certain len */
-	min_len = (uintptr_t)&comm_data.buf[0] - (uintptr_t)&comm_data;
+		is_metadata = !ep_data->is_metadata_read;
 
-        len = read(fd, (char *)&comm_data, sizeof(comm_data));
-	if (len == 0) {
-		/* Host disconnected */
-		fprintf(stderr, "Warning: Host connection terminated: %d\n",
-			ep_data->host_num);
-                close(fd);
-		event_del(ep_data->ev_read);
-		event_free(ep_data->ev_read);
-		free(ep_data);
-		return;
+		/* We need atleast certain len */
+		if (!is_metadata) {
+		
+			req_len = ep_data->data.msg_len - ep_data->msg_read_len;
+			len = bufferevent_read(bev, &ep_data->data.buf[ep_data->msg_read_len],
+						req_len);
 
-	} else if (len < 0) {
-		/* Some other error occurred */
-		warn("Warning: Socket failure, disconnecting host: %d",
-			ep_data->host_num);
-		close(fd);
-		event_del(ep_data->ev_read);
-		event_free(ep_data->ev_read);
-		free(ep_data);
-		return;
-	} else if ((size_t)len < min_len) {
-		warn("Warning: Invalid packet data");
-		return;
+			if (req_len != len)
+				goto err;
+
+			ep_data->is_metadata_read = false;
+			bufferevent_setwatermark(bev, EV_READ,
+						offsetof(comm_data_t, buf), 0);
+		
+		} else {
+			req_len = offsetof(comm_data_t, buf);
+			len = bufferevent_read(bev, (char *)&ep_data->data, 
+						req_len);
+
+			if (len == 0)
+				return;
+
+			if (req_len != len)
+				goto err;
+
+			if (ep_data->data.msg_type == MSG_DATA) {
+				assert(ep_data->data.msg_len != 0);
+
+				req_len = ep_data->data.msg_len;
+	        		len = bufferevent_read(bev, ep_data->data.buf,
+							req_len);
+
+				if (req_len != len) {
+					ep_data->msg_read_len = len;
+					ep_data->is_metadata_read = true;
+					bufferevent_setwatermark(bev, EV_READ,
+							 ep_data->data.msg_len - len,
+							 0);
+				} else {
+					is_metadata = false;
+				}
+			}
+		}
+
+
+		if (ep_data->data.msg_type == MSG_HEARTBEAT_REQ) {
+
+			comm_data_t resp_data;
+			size_t len;
+
+			assert(ep_data->data.msg_len == 0);
+
+			resp_data.msg_type = MSG_HEARTBEAT_RESP;
+			resp_data.msg_len = 0;
+
+			len = offsetof(comm_data_t, buf); 
+		      	if (bufferevent_write(bev, (char *)&resp_data, len) < 0) {
+				warn("Warning: Couldn't send heartbeat: %d",
+						ep_data->host_num);
+			}	
+
+			continue;
+
+		} else if (ep_data->data.msg_type == MSG_DATA) {
+		
+			if (!is_metadata) {
+				/* Call the callback indicating reception of data */
+				handle->ep_callback(ep_data->host_num,
+							 ep_data->data.buf,
+							 ep_data->data.msg_len);
+			}
+
+			continue;
+		} else {
+			warn("Warning: Invalid message type: %d",
+				ep_data->data.msg_type);
+			assert(0);
+			return;
+		}
 	}
 
-	if (comm_data.msg_type == MSG_HEARTBEAT_REQ) {
-
-		assert(comm_data.msg_len == 0);
-
-		/* Send the heartbeat when ready */
-		ep_data->ev_write = event_new(handle->ev_base, fd, EV_WRITE,
-						ep_write, ep_data);
-
-		event_add(ep_data->ev_write, NULL);
-
-		return;
-
-	} else if (comm_data.msg_type == MSG_DATA) {
-		/* Call the callback indicating reception of data */
-		ep_data->ep_handle->ep_callback(ep_data->host_num,
-						 comm_data.buf,
-						 comm_data.msg_len);
-
-		return;
-	} else {
-		warn("Warning: Invalid message type: %d", comm_data.msg_type);
-		assert(0);
-		return;
-	}
-
+err:
+	warn("Warning: Invalid packet data");
+	bufferevent_free(bev);
+	free(ep_data);
+	return;
 }
 
 /*
@@ -516,6 +574,9 @@ static void ep_accept(int fd, short ev, void *arg)
 		warn("Warning: Out of memory");
 		goto err;
 	}
+
+	ep_data->is_metadata_read = false;
+	ep_data->msg_read_len = 0;
 
 	ret = get_ip_addr(&host_addr, ipstr, sizeof(ipstr));
 	if (ret < 0)
@@ -554,11 +615,15 @@ static void ep_accept(int fd, short ev, void *arg)
 	 * read event persistent so we don't have to re-add after each
 	 * read. 
 	 */
-	ep_data->ev_read = event_new(ep_data->ep_handle->ev_base,
-					hfd, EV_READ|EV_PERSIST, ep_read, 
-	    				ep_data);
+	ep_data->bev = bufferevent_socket_new(ep_data->ep_handle->ev_base,
+						hfd, BEV_OPT_CLOSE_ON_FREE);
+	bufferevent_setcb(ep_data->bev, ep_read, ep_write, ep_event, ep_data);
 
-	event_add(ep_data->ev_read, NULL);
+	/* Need to get some metadata first from host before getting payload */
+	bufferevent_setwatermark(ep_data->bev, EV_READ,
+					offsetof(comm_data_t, buf), 0);
+
+	bufferevent_enable(ep_data->bev, EV_READ | EV_WRITE);
 
 	return;
 
