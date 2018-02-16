@@ -92,12 +92,20 @@ void list_for_each(list_t *list, list_iterator_t iterator)
 void *list_pop_head(list_t *list)
 {
 	void *data;
+	list_node_t *cur;
+
 	if (list->len == 0)
 		return NULL;
 
-	data = list->head->data;
-	list->head = list->head->next;
+	cur = list->head;
+	data = cur->data;
+	list->head = cur->next;
 	list->len--;
+
+	free(cur);
+
+	if (list->len == 0)
+		list->tail = NULL;
 
 	return data;
 }
