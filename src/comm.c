@@ -16,6 +16,19 @@
  * TODO: Essentially RPC, But data representation needs to be independent of
  * machine types (RPI and Intel - differences?)
  * FIXME: If no connections on host established with eps, need to fail
+ * TODO: Make API more informative ->
+ * E.g. Allow host to know how many EPs connected presently,
+ * Indicate how many EPs it was able to send message to etc
+ * Is this difficult? As multithreaded, so locks or message passing?
+ * Go memcached type - Use message passing for waking up and locks for data
+ * communication??
+ * TODO: Numbering of packets??
+ * FIXME: What if host comes up before EP?
+ * TODO: Re-establish connection after connection broken
+ * 	- Can't do anything if EP/Host is simply stuck
+ * TODO: Break down API into host and ep (seperate)
+ * TODO: Support corrupted packets detection? MD5?
+ * TODO: Use buffered ev and new libevent library
  */
 
 /* 
@@ -32,6 +45,7 @@
 #include <err.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/types.h>
 
 #include "list.h"
 
@@ -219,7 +233,8 @@ static void host_send_to_ep(int fd, short ev, void *arg)
 	comm_data.msg_len = data->len;
 	comm_data.msg_type = MSG_DATA;
 
-	ret = write(fd, (char *)&comm_data, sizeof(comm_data_t));
+	/* Ignore Sigpipe */
+	ret = send(fd, (char *)&comm_data, sizeof(comm_data_t), MSG_NOSIGNAL);
 	
 	data->ref--;
 
@@ -418,7 +433,7 @@ void ep_read(int fd, short ev, void *arg)
         len = read(fd, (char *)&comm_data, sizeof(comm_data));
 	if (len == 0) {
 		/* Host disconnected */
-		warn("Warning: Host connection terminated: %d",
+		fprintf(stderr, "Warning: Host connection terminated: %d\n",
 			ep_data->host_num);
                 close(fd);
 		event_del(&ep_data->ev_read);
