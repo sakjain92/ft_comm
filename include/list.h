@@ -28,4 +28,7 @@ int list_size(list_t *list);
 void list_for_each(list_t *list, list_iterator_t iterator);
 void *list_pop_head(list_t *list);
 
+/* Remove first entry matching data */
+bool list_remove(list_t *list, void *data);
+
 #endif /* __LIST_H__ */

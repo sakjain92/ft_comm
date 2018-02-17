@@ -168,7 +168,7 @@ int host_send_msg(comm_handle_t *handle, char *buf, size_t len)
 	pthread_mutex_unlock(&handle->lock);
 
 	/* Write dummy char - Just a trigger */
-	bufferevent_write(handle->host_write, DUMMY_TRIGGER_VAL , 1);
+	bufferevent_write(handle->host_write, HOST_TRIGGER_VAL , 1);
 
 	return 0;
 }
@@ -180,11 +180,27 @@ static void *host_event_loop(void *arg)
 
 	event_base_dispatch(handle->ev_base);
 
-	/* Should never return */
-	/* FIXME: The loop will quite currently if connection terminates */
-	assert(0);
+	/* 
+	 * Termination - i.e. all connections terminated
+	 * (either voluntary or due to errors)
+	 * TODO: Retry connections? Then need to make sure this loop doesn't
+	 * exits when all connections temporarily disconnect
+	 */
 
 	return NULL;
+}
+
+/* Called when connection is to be closed after reading/writing out all pending data */
+static void host_end_connection(struct bufferevent *bev, void *arg)
+{
+	(void)arg;
+	bufferevent_free(bev);
+}
+
+static void host_end_connection_event(struct bufferevent *bev, short event, void *arg)
+{
+	(void)event;
+	host_end_connection(bev, arg);
 }
 
 /* Prepares incoming data from host to be sent to eps */
@@ -201,39 +217,72 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 		if (ret == 0)
 			return;
 
-		assert(ch == DUMMY_TRIGGER_VAL[0]);
+		if (ch == HOST_TRIGGER_VAL[0]) {
 
 
-		pthread_mutex_lock(&handle->lock);
-		data = list_pop_head(&handle->data_list);
-		assert(data != NULL);
-		pthread_mutex_unlock(&handle->lock);
+			pthread_mutex_lock(&handle->lock);
+			data = list_pop_head(&handle->data_list);
+			assert(data != NULL);
+			pthread_mutex_unlock(&handle->lock);
 
-		for (i = 0; i < NUM_EPS; i++) {
-			for (j = 0; j < NUM_SWITCHES; j++) {
-	
-				host_data_t *host_data = &handle->host_data[i][j];
-				
-				if (!host_data->is_connected)
-					continue;
+			for (i = 0; i < NUM_EPS; i++) {
+				for (j = 0; j < NUM_SWITCHES; j++) {
+		
+					host_data_t *host_data =
+						&handle->host_data[i][j];
+					
+					if (!host_data->is_connected)
+						continue;
 
-				len = (uintptr_t)&data->buf[data->msg_len] -
-					(uintptr_t)data;
+					len = (uintptr_t)&data->buf[data->msg_len] -
+						(uintptr_t)data;
 
-				ret = bufferevent_write(host_data->bev_write,
-							(char *)data, len);
+					ret = bufferevent_write(host_data->bev_write,
+								(char *)data, len);
 
-				if (ret < 0) {
-					fprintf(stderr, 
-						"WARNING: Sent corrupt data to %d\n",
-						host_data->ep_num);
-					host_data->is_connected = false;
-					bufferevent_free(host_data->bev_write);
+					if (ret < 0) {
+						fprintf(stderr, 
+							"WARNING: Sent corrupt data to %d:%d\n",
+							host_data->ep_num,
+							host_data->ep_sw);
+							host_data->is_connected = false;
+							bufferevent_free(host_data->bev_write);
+					}
 				}
 			}
-		}
 
-		free(data);
+			free(data);
+		} else if (ch == HOST_END_VAL[0]) {
+
+			for (i = 0; i < NUM_EPS; i++) {
+				for (j = 0; j < NUM_SWITCHES; j++) {
+		
+					host_data_t *host_data = &handle->host_data[i][j];
+					
+					if (!host_data->is_connected)
+						continue;
+
+					struct evbuffer *output =
+						bufferevent_get_output(host_data->bev_write);
+					size_t len = evbuffer_get_length(output);
+
+					host_data->is_connected = false;
+
+					if (len == 0) {
+						bufferevent_free(host_data->bev_write);
+					} else {
+						bufferevent_setcb(host_data->bev_write,
+									host_end_connection,
+									host_end_connection,
+									host_end_connection_event,
+									NULL);
+					}
+				}
+			}
+
+		} else {
+			assert(0 && "Unknown message");
+		}
 	}	
 }
 
@@ -255,22 +304,22 @@ static void data_free_fn(void *arg)
 /*
  * This function is called on any error while host is writing to ep
  */
-void host_event(struct bufferevent *bev, short event, void *arg)
+static void host_event(struct bufferevent *bev, short event, void *arg)
 {
 	host_data_t *host_data = (host_data_t *)arg;
 
     	if (event & BEV_EVENT_EOF) {
 		/* EP disconnected */
-		fprintf(stderr, "Warning: EP connection terminated: %d\n",
-			host_data->ep_num);
+		fprintf(stderr, "Warning: EP connection terminated: %d:%d\n",
+			host_data->ep_num, host_data->ep_sw);
 
 	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING) {
 		/* Some other error occurred */
-		warn("Warning: Socket failure, disconnecting ep: %d",
-			host_data->ep_num);
+		warn("Warning: Socket failure, disconnecting ep: %d:%d",
+			host_data->ep_num, host_data->ep_sw);
 	} else {
-		warn("Warning: Unknown error on socket, disconnecting host: %d",
-			host_data->ep_num);
+		warn("Warning: Unknown error on socket, disconnecting host: %d:%d",
+			host_data->ep_num, host_data->ep_sw);
 	} 
 
 	bufferevent_free(bev);
@@ -307,6 +356,7 @@ static int host_init(comm_handle_t *handle)
 	for (i = 0; i < NUM_EPS; i++) {
 		for (j = 0; j < NUM_SWITCHES; j++) {
 			handle->host_data[i][j].ep_num = i;
+			handle->host_data[i][j].ep_sw = j;
 			handle->host_data[i][j].is_connected = false;
 		}
 	}
@@ -415,19 +465,21 @@ void ep_event(struct bufferevent *bev, short event, void *arg)
 
     	if (event & BEV_EVENT_EOF) {
 		/* Host disconnected */
-		fprintf(stderr, "Warning: Host connection terminated: %d\n",
-			ep_data->host_num);
+		fprintf(stderr, "Warning: Host connection terminated: %d:%d\n",
+			ep_data->host_num, ep_data->host_sw);
 
 	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING ||
 			event & BEV_EVENT_READING) {
 		/* Some other error occurred */
-		warn("Warning: Socket failure, disconnecting host: %d",
-			ep_data->host_num);
+		warn("Warning: Socket failure, disconnecting host: %d:%d",
+			ep_data->host_num, ep_data->host_sw);
 	} else {
-		warn("Warning: Unknown error on socket, disconnecting host: %d",
-			ep_data->host_num);
+		warn("Warning: Unknown error on socket, disconnecting host: %d:%d",
+			ep_data->host_num, ep_data->host_sw);
 	} 
 
+	/* Remove connection from the list */
+	list_remove(&ep_data->ep_handle->conn_list, ep_data);
 	bufferevent_free(bev);
 	free(ep_data);
 	return;
@@ -514,8 +566,9 @@ void ep_read(struct bufferevent *bev, void *arg)
 
 			len = offsetof(comm_data_t, buf); 
 		      	if (bufferevent_write(bev, (char *)&resp_data, len) < 0) {
-				warn("Warning: Couldn't send heartbeat: %d",
-						ep_data->host_num);
+				warn("Warning: Couldn't send heartbeat: %d:%d",
+						ep_data->host_num,
+						ep_data->host_sw);
 			}	
 
 			continue;
@@ -525,6 +578,7 @@ void ep_read(struct bufferevent *bev, void *arg)
 			if (!is_metadata) {
 				/* Call the callback indicating reception of data */
 				handle->ep_callback(ep_data->host_num,
+							ep_data->host_sw,
 							 ep_data->data.buf,
 							 ep_data->data.msg_len);
 			}
@@ -540,6 +594,7 @@ void ep_read(struct bufferevent *bev, void *arg)
 
 err:
 	warn("Warning: Invalid packet data");
+	list_remove(&ep_data->ep_handle->conn_list, ep_data);
 	bufferevent_free(bev);
 	free(ep_data);
 	return;
@@ -589,6 +644,7 @@ static void ep_accept(int fd, short ev, void *arg)
 		for (j = 0; j < NUM_SWITCHES; j++) {
 			if (strcmp(hosts[i].ip[j], ipstr) == 0) {
 				ep_data->host_num = i;
+				ep_data->host_sw = j;
 				break;
 			}
 		}
@@ -608,6 +664,9 @@ static void ep_accept(int fd, short ev, void *arg)
 		goto err;
 	}
 
+
+	/* Add to the connections list */
+	list_append(&ep_data->ep_handle->conn_list, (void*)ep_data);
 
 	/* 
 	 * Setup the read event, libevent will call ep_read() whenever
@@ -639,7 +698,8 @@ static int ep_init(comm_handle_t *handle)
 	int optval; /* flag value for setsockopt */
 	struct sockaddr_in epaddr; /* ep's addr */
 	int ret;
-	
+	ep_data_t *ep_data;
+
 	/*
 	 * Setup a port, start listening on it and call the callback whenever
 	 * data arrives or respond to the heartbeats
@@ -706,9 +766,23 @@ static int ep_init(comm_handle_t *handle)
 	
 	event_add(handle->ev_accept, NULL);
 
+	list_new(&handle->conn_list, NULL);
+
 	/* Start the libevent event loop. */
 	event_base_dispatch(handle->ev_base);
 
+	/* We are now closing */
+
+	/* Refuse new connections */
+	close(fd);
+
+	/* Close existing connections */
+	while ((ep_data = (ep_data_t *)list_pop_head(&handle->conn_list)) != NULL) {
+		bufferevent_free(ep_data->bev);
+		free(ep_data);
+	}
+
+	return 0;
 err:
 	close(fd);
 	return ret;
@@ -717,6 +791,8 @@ err:
 /* Initializes the module. Return negative code on error */
 int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 {
+	/* TODO: Run ep_init in seperate thread */
+
 	/* Initialize the event lib */
 	int ret = evthread_use_pthreads();
 	if (ret < 0 || (handle->ev_base = event_base_new()) == NULL) {
@@ -744,5 +820,17 @@ int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 		}
 
 		return ep_init(handle);
+	}
+}
+
+void comm_deinit(comm_handle_t *handle)
+{
+	if (!handle->is_host) {
+		/* For ep, simply quit the loop. That will close all the connections */
+		event_base_loopexit(handle->ev_base, NULL);
+	} else {
+		/* Send signal to end and force flush. Wait for response */
+		bufferevent_write(handle->host_write, HOST_END_VAL , 1);
+		pthread_join(handle->host_event_thread, NULL);
 	}
 }

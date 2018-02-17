@@ -59,7 +59,7 @@ typedef struct {
 
 
 /* Callback function called by comm module for ep when host sends data */
-typedef void (*comm_ep_callback_t)(int host_num, char *buf, int len);
+typedef void (*comm_ep_callback_t)(int host_num, int sw, char *buf, int len);
 
 /* Different types of messages */
 #define MSG_INVALID_TYPE	0
@@ -78,11 +78,14 @@ typedef struct {
 /* Data kept around in host (per ep) */
 typedef struct {
 	int ep_num;
+	int ep_sw;
+
 	bool is_connected;
 	struct bufferevent *bev_write;
 } host_data_t;
 
-#define DUMMY_TRIGGER_VAL	"d"
+#define HOST_TRIGGER_VAL	"t"
+#define HOST_END_VAL		"e"
 
 /* Handle to the state of comm module */
 typedef struct {
@@ -98,6 +101,7 @@ typedef struct {
 	host_data_t host_data[NUM_EPS][NUM_SWITCHES];
 	
 	struct event *ev_accept;
+	list_t conn_list;			/* List of all the current connections */
 	comm_ep_callback_t ep_callback;		/* Callback for ep when data arrives */
 
 } comm_handle_t;
@@ -105,6 +109,8 @@ typedef struct {
 /* Data kept around in ep (per host) */
 typedef struct {
 	int host_num;
+	int host_sw;
+
 	bool is_metadata_read;
 	struct bufferevent *bev;
 	int msg_read_len;			/* How much have been read already */
@@ -113,14 +119,9 @@ typedef struct {
 	comm_handle_t *ep_handle;
 } ep_data_t;
 
-/* Internal structure for pending data to be sent to eps */
-typedef struct {
-	char buf[MAX_DATA_LEN];
-	int len;
-} pending_data_t;
-
 /* Function declarations */
 int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback);
 int host_send_msg(comm_handle_t *handle, char *buf, size_t len);
+void comm_deinit(comm_handle_t *handle);
 
 #endif /* __COMM_H__ */

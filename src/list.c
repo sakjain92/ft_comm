@@ -110,6 +110,42 @@ void *list_pop_head(list_t *list)
 	return data;
 }
 
+bool list_remove(list_t *list, void *data)
+{
+	list_node_t *cur, *prev;
+
+	cur = list->head;
+	prev = NULL;
+
+	while (cur != NULL) {
+		if (cur->data == data) {
+
+			if (prev != NULL)
+				prev->next = cur->next;
+			
+			if (list->free_fn)
+				list->free_fn(cur->data);
+			
+			if (cur == list->head)
+				list->head = list->head->next;
+
+			if (cur == list->tail)
+				list->tail = NULL;
+
+			list->len--;
+
+			free(cur);
+
+			return true;
+		}
+
+		prev = cur;
+		cur = cur->next;
+	}
+
+	return false;
+}
+
 int list_size(list_t *list)
 {
   return list->len;
