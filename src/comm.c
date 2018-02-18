@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <stdarg.h>
 
 #include "list.h"
 
@@ -65,6 +66,51 @@ nodes_t eps[NUM_EPS] = EP_NODES_LIST;
 static void host_connect_cb(int sockfd, short which, void *arg);
 static void host_connect_terminate_now(host_data_t *host_data);
 static void host_connect_terminate_defer(host_data_t *host_data);
+
+/* TODO: Not evertime errno is required */
+
+/* Prints a generic error */
+static void _genericLog(int logType, bool printErrno, char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+
+	switch (logType) {
+	case LOG_FATAL:
+		fprintf(stderr, "ERROR: ");
+		break;
+	case LOG_WARN:
+		fprintf(stderr, "WARNING: ");
+		break;
+	default:
+		assert(0 && "Invalid logging option");
+	}
+
+	vfprintf(stderr, fmt, ap);
+
+	if (printErrno && errno != 0)
+		fprintf(stderr, ": Errno(%s)", strerror(errno));
+
+	fprintf(stderr, "\n");
+	va_end(ap);
+
+}
+
+#define genericLog(...)	_genericLog(__VA_ARGS__)
+#define hostLog(host_data, ...) 				\
+{								\
+	fprintf(stderr, "EP(%d:%d): ",				\
+			host_data->ep_num,			\
+			host_data->ep_sw);			\
+	genericLog(__VA_ARGS__);				\
+}
+#define epLog(ep_data, ...)	 				\
+{								\
+	fprintf(stderr, "HOST(%d:%d): ",			\
+			ep_data->host_num,			\
+			ep_data->host_sw);			\
+	genericLog(__VA_ARGS__);				\
+}
 
 /* Detects if the current node is host/ep */
 static bool is_node_host(void)
@@ -104,7 +150,7 @@ static int set_nonblock(int fd)
 	flags |= O_NONBLOCK;
 	ret = fcntl(fd, F_SETFL, flags);
 	if (ret < 0) {
-		warn("ERROR: Couldn't set fd to nonblocking");
+		genericLog(LOG_FATAL, true, "Couldn't set fd to nonblocking");
 		return ret;
 	}
 
@@ -119,14 +165,14 @@ static int get_ip_addr(struct sockaddr_storage *addr, char *dest_ip, int dest_le
 	/* Check which family is it */
 	if (addr->ss_family != AF_INET) {
 		/* We are only using ipv4 currently */
-		warn("Warning: Ip is ipv6, we support only ipv4");
+		genericLog(LOG_WARN, false, "Ip is ipv6, we support only ipv4");
 		return -EINVAL;
 	}
 
 	s = (struct sockaddr_in *)addr;
 	if (inet_ntop(AF_INET, &s->sin_addr,
 			dest_ip, dest_len) == NULL) {
-		warn("Warning: Couldn't get ipaddr");
+		genericLog(LOG_WARN, false, "Couldn't get ipaddr");
 		return -EINVAL; 
 	}
 
@@ -140,19 +186,20 @@ int host_send_msg(comm_handle_t *handle, char *buf, size_t len)
 	comm_data_t *data;
 
 	if (len == 0) {
-		warn("WARNING: Doesn't support sending empty packets");
+		genericLog(LOG_WARN, false,
+				"Doesn't support sending empty packets");
 		return -EINVAL;
 	}
 
 	if (len > MAX_DATA_LEN) {
-		warn("WARNING: Data too long to send: %zu", len);
+		genericLog(LOG_WARN, false, "Data too long to send: %zu", len);
 		return -EINVAL;
 	}
 
 	/* Read data */
 	data = malloc(sizeof(comm_data_t));
 	if (data == NULL) {
-		fprintf(stderr, "WARNING: Out of memory");
+		genericLog(LOG_WARN, false, "Out of memory");
 		return -ENOMEM;
 	}
 
@@ -164,7 +211,7 @@ int host_send_msg(comm_handle_t *handle, char *buf, size_t len)
 
 	if (list_append(&handle->data_list, data) != true) {
 		free(data);
-		fprintf(stderr, "WARNING: Couldn't add to list");
+		genericLog(LOG_WARN, false, "Couldn't add to list");
 		pthread_mutex_unlock(&handle->lock);
 		return -ENOMEM;
 	}
@@ -252,10 +299,8 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 								(char *)data, len);
 
 					if (ret < 0) {
-						fprintf(stderr, 
-							"WARNING: Sent corrupt data to %d:%d\n",
-							host_data->ep_num,
-							host_data->ep_sw);
+						hostLog(host_data, LOG_WARN, false,  
+							"Sent corrupt data");
 					
 						host_connect_terminate_now(host_data);
 					}
@@ -313,18 +358,18 @@ static void host_event(struct bufferevent *bev, short event, void *arg)
     	if (event & BEV_EVENT_EOF) {
 		/* EP disconnected */
 		host_connect_terminate_now(host_data);
-		fprintf(stderr, "Warning: EP connection terminated: %d:%d\n",
-			host_data->ep_num, host_data->ep_sw);
+		hostLog(host_data, LOG_WARN, false,
+				"EP connection terminated");
 
 	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING) {
 		/* Some other error occurred */
 		host_connect_terminate_now(host_data);
-		warn("Warning: Socket failure, disconnecting ep: %d:%d",
-			host_data->ep_num, host_data->ep_sw);
+		hostLog(host_data, LOG_WARN, false,
+				"Socket failure, disconnecting ep");
 	} else {
 		host_connect_terminate_now(host_data);
-		warn("Warning: Unknown error on socket, disconnecting host: %d:%d",
-			host_data->ep_num, host_data->ep_sw);
+		hostLog(host_data, LOG_WARN, false,
+				"Unknown error on socket, disconnecting ep");
 	} 
 
 	return;
@@ -353,14 +398,6 @@ static void host_connect_terminate_defer(host_data_t *host_data)
 	handle->num_succ_conns--;
 	pthread_mutex_unlock(&handle->lock);
 }
-e sent to eps */
-static void host_incoming_data(struct bufferevent *bev, void *arg)
-{
-	comm_handle_t *handle = (comm_handle_t *)arg;
-	comm_data_t *data;
-	int i, j, ret, len;
-	char ch;
-
 
 /* Called when connection to host terminated quickly */
 static void host_connect_terminate_now(host_data_t *host_data)
@@ -380,8 +417,7 @@ static void host_connect_terminate_now(host_data_t *host_data)
 /* Called when connection to host failed */
 static void host_connect_fail(host_data_t *host_data)
 {
-	warn("Warning: Couldn't connect to ep: %d:%d",
-			host_data->ep_num, host_data->ep_sw);
+	hostLog(host_data, LOG_WARN, false, "Couldn't connect to ep");
 
 }
 
@@ -454,7 +490,7 @@ static void host_connect_cb(int sockfd, short which, void *arg)
 
 	ret = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen);
 	if (ret < 0) {
-		warn("Warning: getsockopt() failed");
+		genericLog(LOG_WARN, true, "getsockopt() failed");
 	}
 
 	if (optval == 0) {
@@ -491,7 +527,7 @@ static int host_init(comm_handle_t *handle)
 
 	ret = bufferevent_pair_new(handle->ev_base, BEV_OPT_CLOSE_ON_FREE, pair);
 	if (ret < 0) {
-		warn("ERROR: Couldn't open pipes: %d", ret);
+		genericLog(LOG_FATAL, true, "Couldn't open pipes");
 		return ret;
 	}
 
@@ -530,8 +566,8 @@ static int host_init(comm_handle_t *handle)
 					
 	    		sockfd = socket(AF_INET, SOCK_STREAM, 0);
     			if (sockfd < 0) {
-        			warn("WARNING: Couldn't open socket with ep %s",
-					ep_name);
+				hostLog(host_data, LOG_WARN, true,
+						"Couldn't open socket with ep");
 				continue;
 			}
 
@@ -543,7 +579,8 @@ static int host_init(comm_handle_t *handle)
 
 			server = gethostbyname(ep_name);
 			if (server == NULL) {
-				warn("WARNING: Issue in EPs ipaddr: %s", ep_name);
+				hostLog(host_data, LOG_WARN, false, 
+					"Issue in EPs ipaddr", ep_name);
 				close(sockfd);
 				continue;
 			}
@@ -591,7 +628,7 @@ static int host_init(comm_handle_t *handle)
 
 	ret = pthread_mutex_init(&handle->lock, NULL);
 	if (ret < 0) {
-		printf("ERROR: Mutex init failed\n");
+		genericLog(LOG_FATAL, true, "Mutex init failed");
 		goto sock_err;
 	}
 
@@ -599,7 +636,8 @@ static int host_init(comm_handle_t *handle)
 	ret = pthread_create(&handle->host_event_thread, NULL,
 				host_event_loop, (void *)handle);
 	if (ret < 0) {
-		warn("ERROR: Couldn't start a new event handler thread: %d", ret);
+		genericLog(LOG_FATAL, true, 
+				"Couldn't start a new event handler thread");
 		goto thread_err;
 	}
 
@@ -616,7 +654,7 @@ static int host_init(comm_handle_t *handle)
 	pthread_mutex_unlock(&handle->lock);
 
 	if (num_conn == 0) {
-		warn("ERROR: No connections established");
+		genericLog(LOG_FATAL, false, "No connections established");
 		return -1;
 	}
 
@@ -648,17 +686,17 @@ void ep_event(struct bufferevent *bev, short event, void *arg)
 
     	if (event & BEV_EVENT_EOF) {
 		/* Host disconnected */
-		fprintf(stderr, "Warning: Host connection terminated: %d:%d\n",
-			ep_data->host_num, ep_data->host_sw);
+		epLog(ep_data, LOG_WARN, false,
+			"Host connection terminated");
 
 	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING ||
 			event & BEV_EVENT_READING) {
 		/* Some other error occurred */
-		warn("Warning: Socket failure, disconnecting host: %d:%d",
-			ep_data->host_num, ep_data->host_sw);
+		epLog(ep_data, LOG_WARN, false,
+			"Socket failure, disconnecting host");
 	} else {
-		warn("Warning: Unknown error on socket, disconnecting host: %d:%d",
-			ep_data->host_num, ep_data->host_sw);
+		epLog(ep_data, LOG_WARN, false,
+			"Unknown error on socket, disconnecting host");
 	} 
 
 	/* Remove connection from the list */
@@ -749,9 +787,8 @@ void ep_read(struct bufferevent *bev, void *arg)
 
 			len = offsetof(comm_data_t, buf); 
 		      	if (bufferevent_write(bev, (char *)&resp_data, len) < 0) {
-				warn("Warning: Couldn't send heartbeat: %d:%d",
-						ep_data->host_num,
-						ep_data->host_sw);
+				epLog(ep_data, LOG_WARN, false,
+					"Couldn't send heartbeat");
 			}	
 
 			continue;
@@ -770,7 +807,7 @@ void ep_read(struct bufferevent *bev, void *arg)
 
 			continue;
 		} else {
-			warn("Warning: Invalid message type: %d",
+			genericLog(LOG_WARN, false, "Invalid message type: %d",
 				ep_data->data.msg_type);
 			assert(0);
 			return;
@@ -778,7 +815,7 @@ void ep_read(struct bufferevent *bev, void *arg)
 	}
 
 err:
-	warn("Warning: Invalid packet data");
+	genericLog(LOG_WARN, false, "Invalid packet data");
 	list_remove(&ep_data->ep_handle->conn_list, ep_data);
 	bufferevent_free(bev);
 	free(ep_data);
@@ -805,13 +842,13 @@ static void ep_accept(int fd, short ev, void *arg)
 	/* Accept the new connection. */
 	hfd = accept(fd, (struct sockaddr *)&host_addr, &addr_len);
 	if (fd < 0) {
-		warn("Warning: Accept failed: %d", hfd);
+		genericLog(LOG_WARN, true, "Accept failed");
 		return;
 	}
 
 	ep_data = malloc(sizeof(ep_data_t));
 	if (ep_data == NULL) {
-		warn("Warning: Out of memory");
+		genericLog(LOG_WARN, false, "Out of memory");
 		goto err;
 	}
 
@@ -838,14 +875,14 @@ static void ep_accept(int fd, short ev, void *arg)
 	}
 
 	if (ep_data->host_num == -1) {
-		warn("Warning: Unknow host contacted endpoint: %s", ipstr);
+		genericLog(LOG_WARN, false,
+				"Unknow host contacted endpoint: %s", ipstr);
 		goto err;
 	}
 
 	/* Set the client socket to non-blocking mode. */
 	ret = set_nonblock(hfd);
 	if (ret < 0) {
-		warn("Warning: Failed to set host socket non-blocking: %d", ret);
 		goto err;
 	}
 
@@ -891,7 +928,8 @@ static int ep_init(comm_handle_t *handle)
 	 */
 	fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
-		warn("ERROR: Couldn't open socket for endpoint");
+		genericLog(LOG_FATAL, true,
+				"Couldn't open socket for endpoint");
 		return fd;
 	}
 
@@ -922,7 +960,8 @@ static int ep_init(comm_handle_t *handle)
 	ret = bind(fd, (struct sockaddr *)&epaddr, 
 	   		sizeof(epaddr));
 	if (ret < 0) {
-    		warn("ERROR: Endpoint couldn't bind to port: %d",
+		genericLog(LOG_FATAL, true,
+				"Endpoint couldn't bind to port: %d",
 				EP_LISTEN_PORT);
 		goto err;
 	}
@@ -932,9 +971,10 @@ static int ep_init(comm_handle_t *handle)
 	 */
   	ret = listen(fd, EP_LISTEN_QUEUE_SIZE);
 	if (ret < 0) {
-	    warn("ERROR: Endpoint couldn't listen on port: %d",
-			    EP_LISTEN_PORT);
-	    goto err;
+		genericLog(LOG_FATAL, true,
+				"Endpoint couldn't listen on port: %d",
+			    	EP_LISTEN_PORT);
+		goto err;
 	}
 
 	ret = set_nonblock(fd);
@@ -981,7 +1021,8 @@ int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 	/* Initialize the event lib */
 	int ret = evthread_use_pthreads();
 	if (ret < 0 || (handle->ev_base = event_base_new()) == NULL) {
-		fprintf(stderr, "Error: Libevent initialization failed\n");
+		genericLog(LOG_WARN, false,
+				"Libevent initialization failed");
 		return -EINVAL;
 	}
 
@@ -991,7 +1032,8 @@ int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 	if (handle->is_host) {
 
 		if (ep_callback != NULL) {
-			warn("Error: Callback mentioned for a host node");
+			genericLog(LOG_WARN, false,
+					"Callback mentioned for a host node");
 			return -EINVAL;
 		}
 		
@@ -999,8 +1041,9 @@ int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 	} else {
 
 		if (ep_callback == NULL) {
-			
-			warn("Error: No callback for endpoint node");
+		
+			genericLog(LOG_WARN, false,
+					"No callback for endpoint node");
 			return -EINVAL;
 		}
 

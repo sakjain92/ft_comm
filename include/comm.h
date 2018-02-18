@@ -15,6 +15,9 @@
 
 /**** Configurable parameters ****/
 
+/* Enable this macro only if testing */
+#define TESTING
+
 #define NUM_HOSTS	4
 #define NUM_EPS		3
 
@@ -58,6 +61,10 @@
 #define MAX_CONN_RETRIES		3
 
 /**** End of configurable paramters ****/
+
+/* Logging Type */
+#define LOG_FATAL	1
+#define LOG_WARN	2
 
 /* ID of different nodes */
 typedef struct {
