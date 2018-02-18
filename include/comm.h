@@ -62,6 +62,13 @@
 
 /**** End of configurable paramters ****/
 
+/* Error Code */
+#define HOST_CONNECT_FAIL	1
+#define HOST_CONNECT_TERMINATE	2
+#define EP_CONNECT_TERMINATE	4
+#define EP_HEARTBEAT_FAIL	5
+#define EP_INVALID_MSG		6
+
 /* Logging Type */
 #define LOG_FATAL	1
 #define LOG_WARN	2
@@ -78,8 +85,11 @@ typedef struct {
 
 
 /* Callback function called by comm module for ep when host sends data */
-typedef void (*comm_ep_callback_t)(int host_num, int sw, int session,
+typedef void (*comm_ep_data_callback_t)(int host_num, int sw, int session,
 					int msg_num, char *buf, int len);
+
+/* Callback called by comm module when host/ep notice connection failure */
+typedef void (*comm_err_callback_t)(int node_num, int sw, int reason);
 
 /* Different types of messages */
 #define MSG_INVALID_TYPE	0
@@ -118,8 +128,8 @@ typedef struct {
 /* Handle to the state of comm module */
 typedef struct comm_handle {
 	bool is_host;
-
 	struct event_base *ev_base;
+	comm_err_callback_t err_callback;
 
 	pthread_t host_event_thread;
 	struct bufferevent *host_write;		/* Write to this pipe initiates writes to eps */
@@ -136,7 +146,7 @@ typedef struct comm_handle {
 
 	struct event *ev_accept;
 	list_t conn_list;			/* List of all the current connections */
-	comm_ep_callback_t ep_callback;		/* Callback for ep when data arrives */
+	comm_ep_data_callback_t ep_callback;		/* Callback for ep when data arrives */
 
 } comm_handle_t;
 
@@ -154,7 +164,8 @@ typedef struct {
 } ep_data_t;
 
 /* Function declarations */
-int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback);
+int comm_init(comm_handle_t *handle, comm_err_callback_t err_callback,
+		comm_ep_data_callback_t ep_data_callback);
 int host_send_msg(comm_handle_t *handle, char *buf, size_t len);
 void comm_deinit(comm_handle_t *handle);
 

@@ -179,6 +179,34 @@ static int get_ip_addr(struct sockaddr_storage *addr, char *dest_ip, int dest_le
 	return 0;
 }
 
+/* Host error */
+static void host_err(host_data_t *host_data, int errType)
+{
+	comm_handle_t *handle = host_data->handle;
+	assert(errType == HOST_CONNECT_FAIL ||
+			errType == HOST_CONNECT_TERMINATE);
+	
+	if (handle->err_callback) {
+		handle->err_callback(host_data->ep_num,
+					host_data->ep_sw,
+					errType);
+	}	
+}
+
+/* EP error */
+static void ep_err(ep_data_t *ep_data, int errType)
+{
+	comm_handle_t *handle = ep_data->ep_handle;
+	assert(errType == EP_CONNECT_TERMINATE ||
+			errType == EP_HEARTBEAT_FAIL ||
+			errType == EP_INVALID_MSG);
+	
+	if (handle->err_callback)
+		handle->err_callback(ep_data->host_num,
+					ep_data->host_sw,
+					errType);
+}
+
 /* Used by host to send msg to all the eps */
 int host_send_msg(comm_handle_t *handle, char *buf, size_t len)
 {
@@ -244,8 +272,14 @@ static void *host_event_loop(void *arg)
 /* Called when connection is to be closed after reading/writing out all pending data */
 static void host_end_connection(struct bufferevent *bev, void *arg)
 {
-	(void)arg;
+	host_data_t *host_data = (host_data_t *)arg;
+	
 	bufferevent_free(bev);
+
+	/* Voluntary termination - So no error */
+
+	(void)host_data;
+	/* host_err(host_data, HOST_CONNECT_TERMINATE); */
 }
 
 static void host_end_connection_event(struct bufferevent *bev, short event, void *arg)
@@ -370,12 +404,15 @@ static void host_event(struct bufferevent *bev, short event, void *arg)
 		host_connect_terminate_now(host_data);
 		hostLog(host_data, LOG_WARN, false,
 				"Unknown error on socket, disconnecting ep");
-	} 
+	}
 
 	return;
 }
 
-/* Called when connection is to be terminated after sending pending data */
+/* 
+ * Called when connection is to be terminated after sending pending data 
+ * This is voluntary closing of connection
+ */
 static void host_connect_terminate_defer(host_data_t *host_data)
 {
 	comm_handle_t *handle = host_data->handle;
@@ -391,7 +428,7 @@ static void host_connect_terminate_defer(host_data_t *host_data)
 					host_end_connection,
 					host_end_connection,
 					host_end_connection_event,
-					NULL);
+					host_data);
 	}
 
 	pthread_mutex_lock(&handle->lock);
@@ -411,15 +448,10 @@ static void host_connect_terminate_now(host_data_t *host_data)
 	pthread_mutex_lock(&handle->lock);
 	handle->num_succ_conns--;
 	pthread_mutex_unlock(&handle->lock);
+
+	host_err(host_data, HOST_CONNECT_TERMINATE);
 }
 
-
-/* Called when connection to host failed */
-static void host_connect_fail(host_data_t *host_data)
-{
-	hostLog(host_data, LOG_WARN, false, "Couldn't connect to ep");
-
-}
 
 /* Tries to reconnect after failed attempt - Doesn't immedaitely reconnect */
 static bool host_try_reconnect(int sockfd, host_data_t *host_data)
@@ -439,7 +471,8 @@ static bool host_try_reconnect(int sockfd, host_data_t *host_data)
 		return true;
 	}
 
-	host_connect_fail(host_data);
+	hostLog(host_data, LOG_WARN, false, "Couldn't connect to ep");
+	host_err(host_data, HOST_CONNECT_FAIL);
 
 	sem_post(&host_data->handle->connect_sem);
 
@@ -491,6 +524,8 @@ static void host_connect_cb(int sockfd, short which, void *arg)
 	ret = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen);
 	if (ret < 0) {
 		genericLog(LOG_WARN, true, "getsockopt() failed");
+		host_err(host_data, HOST_CONNECT_FAIL);
+		return;
 	}
 
 	if (optval == 0) {
@@ -568,11 +603,13 @@ static int host_init(comm_handle_t *handle)
     			if (sockfd < 0) {
 				hostLog(host_data, LOG_WARN, true,
 						"Couldn't open socket with ep");
+				host_err(host_data, HOST_CONNECT_FAIL);
 				continue;
 			}
 
 			ret = set_nonblock(sockfd);
 			if (ret < 0) {
+				host_err(host_data, HOST_CONNECT_FAIL);
 				close(sockfd);
 				continue;
 			}
@@ -581,6 +618,8 @@ static int host_init(comm_handle_t *handle)
 			if (server == NULL) {
 				hostLog(host_data, LOG_WARN, false, 
 					"Issue in EPs ipaddr", ep_name);
+				host_err(host_data, HOST_CONNECT_FAIL);
+
 				close(sockfd);
 				continue;
 			}
@@ -699,6 +738,8 @@ void ep_event(struct bufferevent *bev, short event, void *arg)
 			"Unknown error on socket, disconnecting host");
 	} 
 
+	ep_err(ep_data, EP_CONNECT_TERMINATE);
+
 	/* Remove connection from the list */
 	list_remove(&ep_data->ep_handle->conn_list, ep_data);
 	bufferevent_free(bev);
@@ -789,6 +830,7 @@ void ep_read(struct bufferevent *bev, void *arg)
 		      	if (bufferevent_write(bev, (char *)&resp_data, len) < 0) {
 				epLog(ep_data, LOG_WARN, false,
 					"Couldn't send heartbeat");
+				ep_err(ep_data, EP_HEARTBEAT_FAIL);
 			}	
 
 			continue;
@@ -809,6 +851,7 @@ void ep_read(struct bufferevent *bev, void *arg)
 		} else {
 			genericLog(LOG_WARN, false, "Invalid message type: %d",
 				ep_data->data.msg_type);
+			/* XXX: I assume TCP and ethernet checksum are sufficient */
 			assert(0);
 			return;
 		}
@@ -816,6 +859,8 @@ void ep_read(struct bufferevent *bev, void *arg)
 
 err:
 	genericLog(LOG_WARN, false, "Invalid packet data");
+	ep_err(ep_data, EP_INVALID_MSG);
+
 	list_remove(&ep_data->ep_handle->conn_list, ep_data);
 	bufferevent_free(bev);
 	free(ep_data);
@@ -1014,7 +1059,8 @@ err:
 }
 
 /* Initializes the module. Return negative code on error */
-int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
+int comm_init(comm_handle_t *handle, comm_err_callback_t err_callback,
+		comm_ep_data_callback_t ep_callback)
 {
 	/* TODO: Run ep_init in seperate thread */
 
@@ -1028,6 +1074,7 @@ int comm_init(comm_handle_t *handle, comm_ep_callback_t ep_callback)
 
 	handle->is_host = is_node_host();
 	handle->ep_callback = ep_callback;
+	handle->err_callback = err_callback;
 
 	if (handle->is_host) {
 

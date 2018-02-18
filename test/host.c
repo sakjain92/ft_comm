@@ -52,6 +52,24 @@ void parse_inputs(int argc, char **argv)
 	}
 }
 
+/* Error */
+void err_callback(int node_num, int sw, int reason)
+{
+	printf("ERROR_CALLABCK:(%d:%d) ", node_num, sw);
+
+	switch (reason) {
+	case HOST_CONNECT_FAIL:
+		printf("Couldn't connect to EP\n");
+		break;
+	case HOST_CONNECT_TERMINATE:
+		printf("EP Connection failed\n");
+		break;
+	default:
+		printf("Unknown error\n");
+		break;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	comm_handle_t handle;
@@ -60,7 +78,7 @@ int main(int argc, char **argv)
 	
 	parse_inputs(argc, argv);
 
-	ret = comm_init(&handle, NULL);
+	ret = comm_init(&handle, err_callback, NULL);
 	if (ret < 0)
 		return ret;
 
