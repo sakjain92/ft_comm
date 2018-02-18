@@ -45,6 +45,15 @@
 
 #define MAX_DATA_LEN	4096
 
+/* Maximum seconds to wait for connection to be established */
+#define MAX_CONN_TIMEOUT_SEC		5
+
+/* Interval between retrying to connect */
+#define MAX_CONN_RETRY_TIMEOUT_SEC	2
+
+/* Maximum times to try to reconnect */
+#define MAX_CONN_RETRIES		3
+
 /**** End of configurable paramters ****/
 
 /* ID of different nodes */
@@ -59,7 +68,8 @@ typedef struct {
 
 
 /* Callback function called by comm module for ep when host sends data */
-typedef void (*comm_ep_callback_t)(int host_num, int sw, char *buf, int len);
+typedef void (*comm_ep_callback_t)(int host_num, int sw, int session,
+					int msg_num, char *buf, int len);
 
 /* Different types of messages */
 #define MSG_INVALID_TYPE	0
@@ -71,6 +81,9 @@ typedef void (*comm_ep_callback_t)(int host_num, int sw, char *buf, int len);
 typedef struct {
 	int msg_type;
 	int msg_len;
+	int msg_num;
+	/* Different instance of same host have different sessions */
+	int session;
 	char buf[MAX_DATA_LEN];
 } comm_data_t;
 
@@ -81,6 +94,7 @@ typedef struct {
 	int ep_sw;
 
 	bool is_connected;
+	int retries_left;
 	struct bufferevent *bev_write;
 } host_data_t;
 
@@ -99,6 +113,8 @@ typedef struct {
 	pthread_mutex_t lock;
 	list_t data_list;			/* Pending data to be sent */
 	host_data_t host_data[NUM_EPS][NUM_SWITCHES];
+	int num_msg_sent;
+	int session;
 	
 	struct event *ev_accept;
 	list_t conn_list;			/* List of all the current connections */

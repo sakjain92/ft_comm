@@ -94,8 +94,10 @@ static int set_nonblock(int fd)
 	int flags;
 	int ret;
 	flags = fcntl(fd, F_GETFL);
-	if (flags < 0)
+	if (flags < 0) {
+		
 		return flags;
+	}
 
 	flags |= O_NONBLOCK;
 	ret = fcntl(fd, F_SETFL, flags);
@@ -219,11 +221,13 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 
 		if (ch == HOST_TRIGGER_VAL[0]) {
 
-
 			pthread_mutex_lock(&handle->lock);
 			data = list_pop_head(&handle->data_list);
 			assert(data != NULL);
 			pthread_mutex_unlock(&handle->lock);
+
+			data->session = handle->session;
+			data->msg_num = handle->num_msg_sent;
 
 			for (i = 0; i < NUM_EPS; i++) {
 				for (j = 0; j < NUM_SWITCHES; j++) {
@@ -234,6 +238,11 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 					if (!host_data->is_connected)
 						continue;
 
+					/* 
+					 * XXX: Do we wish to keep the data lying
+					 * around when an ep temporarily is not
+					 * connected so that we can sent it later
+					 */
 					len = (uintptr_t)&data->buf[data->msg_len] -
 						(uintptr_t)data;
 
@@ -245,13 +254,17 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 							"WARNING: Sent corrupt data to %d:%d\n",
 							host_data->ep_num,
 							host_data->ep_sw);
-							host_data->is_connected = false;
-							bufferevent_free(host_data->bev_write);
+						
+						host_data->is_connected = false;
+						bufferevent_free(host_data->bev_write);
 					}
 				}
 			}
 
 			free(data);
+
+			handle->num_msg_sent++;
+
 		} else if (ch == HOST_END_VAL[0]) {
 
 			for (i = 0; i < NUM_EPS; i++) {
@@ -337,6 +350,10 @@ static int host_init(comm_handle_t *handle)
 	/* Create a pipe to comm with the new thread being spawned */
 	int i, j, ret;
 	struct bufferevent *pair[2];
+
+	srand(time(0));
+	handle->num_msg_sent = 0;
+	handle->session = rand();
 
 	ret = bufferevent_pair_new(handle->ev_base, BEV_OPT_CLOSE_ON_FREE, pair);
 	if (ret < 0) {
@@ -579,8 +596,10 @@ void ep_read(struct bufferevent *bev, void *arg)
 				/* Call the callback indicating reception of data */
 				handle->ep_callback(ep_data->host_num,
 							ep_data->host_sw,
-							 ep_data->data.buf,
-							 ep_data->data.msg_len);
+							ep_data->data.session,
+							ep_data->data.msg_num,
+							ep_data->data.buf,
+							ep_data->data.msg_len);
 			}
 
 			continue;
