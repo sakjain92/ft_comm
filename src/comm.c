@@ -10,9 +10,7 @@
  */
 
 /*
- * TODO: Use newer libevent library
  * TODO: Seperate initialization and looping for ep
- * TODO: When can't send data (because of any error), stop the connection
  * TODO: Essentially RPC, But data representation needs to be independent of
  * machine types (RPI and Intel - differences?)
  * FIXME: If no connections on host established with eps, need to fail
@@ -23,12 +21,10 @@
  * Go memcached type - Use message passing for waking up and locks for data
  * communication??
  * TODO: Numbering of packets??
- * FIXME: What if host comes up before EP?
  * TODO: Re-establish connection after connection broken
  * 	- Can't do anything if EP/Host is simply stuck
  * TODO: Break down API into host and ep (seperate)
  * TODO: Support corrupted packets detection? MD5?
- * TODO: Use buffered ev and new libevent library
  * TODO: Error handling of libevent
  */
 
@@ -59,10 +55,16 @@
 
 /* In host, need a seperate thread for event loop */
 #include <pthread.h>
+#include <semaphore.h>
 
 /* List of hosts and endpoints */
 nodes_t hosts[NUM_HOSTS] = HOST_NODES_LIST;
 nodes_t eps[NUM_EPS] = EP_NODES_LIST;
+
+/* Forward declaration */
+static void host_connect_cb(int sockfd, short which, void *arg);
+static void host_connect_terminate_now(host_data_t *host_data);
+static void host_connect_terminate_defer(host_data_t *host_data);
 
 /* Detects if the current node is host/ep */
 static bool is_node_host(void)
@@ -254,9 +256,8 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 							"WARNING: Sent corrupt data to %d:%d\n",
 							host_data->ep_num,
 							host_data->ep_sw);
-						
-						host_data->is_connected = false;
-						bufferevent_free(host_data->bev_write);
+					
+						host_connect_terminate_now(host_data);
 					}
 				}
 			}
@@ -275,21 +276,7 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 					if (!host_data->is_connected)
 						continue;
 
-					struct evbuffer *output =
-						bufferevent_get_output(host_data->bev_write);
-					size_t len = evbuffer_get_length(output);
-
-					host_data->is_connected = false;
-
-					if (len == 0) {
-						bufferevent_free(host_data->bev_write);
-					} else {
-						bufferevent_setcb(host_data->bev_write,
-									host_end_connection,
-									host_end_connection,
-									host_end_connection_event,
-									NULL);
-					}
+					host_connect_terminate_defer(host_data);
 				}
 			}
 
@@ -321,22 +308,165 @@ static void host_event(struct bufferevent *bev, short event, void *arg)
 {
 	host_data_t *host_data = (host_data_t *)arg;
 
+	(void)bev;
+
     	if (event & BEV_EVENT_EOF) {
 		/* EP disconnected */
+		host_connect_terminate_now(host_data);
 		fprintf(stderr, "Warning: EP connection terminated: %d:%d\n",
 			host_data->ep_num, host_data->ep_sw);
 
 	} else if (event & BEV_EVENT_ERROR || event & BEV_EVENT_WRITING) {
 		/* Some other error occurred */
+		host_connect_terminate_now(host_data);
 		warn("Warning: Socket failure, disconnecting ep: %d:%d",
 			host_data->ep_num, host_data->ep_sw);
 	} else {
+		host_connect_terminate_now(host_data);
 		warn("Warning: Unknown error on socket, disconnecting host: %d:%d",
 			host_data->ep_num, host_data->ep_sw);
 	} 
 
-	bufferevent_free(bev);
 	return;
+}
+
+/* Called when connection is to be terminated after sending pending data */
+static void host_connect_terminate_defer(host_data_t *host_data)
+{
+	comm_handle_t *handle = host_data->handle;
+	struct evbuffer *output = bufferevent_get_output(host_data->bev_write);
+	size_t len = evbuffer_get_length(output);
+
+	host_data->is_connected = false;
+
+	if (len == 0) {
+		bufferevent_free(host_data->bev_write);
+	} else {
+		bufferevent_setcb(host_data->bev_write,
+					host_end_connection,
+					host_end_connection,
+					host_end_connection_event,
+					NULL);
+	}
+
+	pthread_mutex_lock(&handle->lock);
+	handle->num_succ_conns--;
+	pthread_mutex_unlock(&handle->lock);
+}
+e sent to eps */
+static void host_incoming_data(struct bufferevent *bev, void *arg)
+{
+	comm_handle_t *handle = (comm_handle_t *)arg;
+	comm_data_t *data;
+	int i, j, ret, len;
+	char ch;
+
+
+/* Called when connection to host terminated quickly */
+static void host_connect_terminate_now(host_data_t *host_data)
+{
+	comm_handle_t *handle = host_data->handle;
+
+	host_data->is_connected = false;
+
+	bufferevent_free(host_data->bev_write);
+
+	pthread_mutex_lock(&handle->lock);
+	handle->num_succ_conns--;
+	pthread_mutex_unlock(&handle->lock);
+}
+
+
+/* Called when connection to host failed */
+static void host_connect_fail(host_data_t *host_data)
+{
+	warn("Warning: Couldn't connect to ep: %d:%d",
+			host_data->ep_num, host_data->ep_sw);
+
+}
+
+/* Tries to reconnect after failed attempt - Doesn't immedaitely reconnect */
+static bool host_try_reconnect(int sockfd, host_data_t *host_data)
+{
+	if (--host_data->retries_left > 0) {
+
+		struct timeval tv;
+		host_data->ev_connect =
+			event_new(host_data->handle->ev_base, sockfd,
+					0, host_connect_cb,
+					host_data);
+				
+		tv.tv_sec = MAX_CONN_RETRY_TIMEOUT_SEC;
+		tv.tv_usec = 0;
+
+		event_add(host_data->ev_connect, &tv);
+		return true;
+	}
+
+	host_connect_fail(host_data);
+
+	sem_post(&host_data->handle->connect_sem);
+
+	return false;
+}
+
+/* Call this after connection estabished by host with ep */
+static void host_connected(int sockfd, host_data_t *host_data)
+{
+	comm_handle_t *handle = host_data->handle;
+
+	host_data->bev_write =
+		bufferevent_socket_new(host_data->handle->ev_base, sockfd,
+					BEV_OPT_CLOSE_ON_FREE);
+
+	host_data->is_connected = true;
+			
+	bufferevent_setcb(host_data->bev_write,
+				host_got_heartbeat,
+				NULL,
+				host_event,
+				host_data);
+
+	bufferevent_enable(host_data->bev_write,
+				EV_READ | EV_WRITE);
+
+	pthread_mutex_lock(&handle->lock);
+	handle->num_succ_conns++;
+	pthread_mutex_unlock(&handle->lock);
+
+	sem_post(&host_data->handle->connect_sem);
+}
+
+/* Called when finally connect succeeded or timeout */
+static void host_connect_cb(int sockfd, short which, void *arg)
+{
+	socklen_t optlen;
+	int ret, optval;
+	host_data_t *host_data = (host_data_t *)arg;
+
+	(void)which;
+
+	assert(host_data->is_connected == false);
+
+	event_del(host_data->ev_connect);
+	event_free(host_data->ev_connect);
+
+
+	ret = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen);
+	if (ret < 0) {
+		warn("Warning: getsockopt() failed");
+	}
+
+	if (optval == 0) {
+		/* connection successful */
+		host_connected(sockfd, host_data);
+		return;
+	} else {
+
+		host_try_reconnect(sockfd, host_data);
+		return;
+	}
+	
 }
 
 /* Initialize the host. Return negative code on error */
@@ -350,10 +480,14 @@ static int host_init(comm_handle_t *handle)
 	/* Create a pipe to comm with the new thread being spawned */
 	int i, j, ret;
 	struct bufferevent *pair[2];
+	int num_conn;
 
 	srand(time(0));
 	handle->num_msg_sent = 0;
 	handle->session = rand();
+	handle->num_succ_conns = 0;
+
+	sem_init(&handle->connect_sem, 0, 0);
 
 	ret = bufferevent_pair_new(handle->ev_base, BEV_OPT_CLOSE_ON_FREE, pair);
 	if (ret < 0) {
@@ -372,9 +506,14 @@ static int host_init(comm_handle_t *handle)
 	/* Initialization */
 	for (i = 0; i < NUM_EPS; i++) {
 		for (j = 0; j < NUM_SWITCHES; j++) {
-			handle->host_data[i][j].ep_num = i;
-			handle->host_data[i][j].ep_sw = j;
-			handle->host_data[i][j].is_connected = false;
+			host_data_t *host_data = &handle->host_data[i][j];
+
+			host_data->ep_num = i;
+			host_data->ep_sw = j;
+			host_data->is_connected = false;
+			host_data->retries_left = MAX_CONN_RETRIES;
+			host_data->ev_connect = NULL;
+			host_data->handle = handle;
 		}
 	}
 
@@ -386,7 +525,9 @@ static int host_init(comm_handle_t *handle)
 			struct sockaddr_in serveraddr;
 			int sockfd;
 			char *ep_name = eps[i].ip[j];
-				
+			
+			host_data_t *host_data = &handle->host_data[i][j];
+					
 	    		sockfd = socket(AF_INET, SOCK_STREAM, 0);
     			if (sockfd < 0) {
         			warn("WARNING: Couldn't open socket with ep %s",
@@ -394,11 +535,16 @@ static int host_init(comm_handle_t *handle)
 				continue;
 			}
 
+			ret = set_nonblock(sockfd);
+			if (ret < 0) {
+				close(sockfd);
+				continue;
+			}
+
 			server = gethostbyname(ep_name);
 			if (server == NULL) {
 				warn("WARNING: Issue in EPs ipaddr: %s", ep_name);
 				close(sockfd);
-				sockfd = -1;
 				continue;
 			}
 
@@ -413,28 +559,31 @@ static int host_init(comm_handle_t *handle)
 			/* connect: create a connection with the server */
     			ret = connect(sockfd, (struct sockaddr *)&serveraddr,
 					sizeof(serveraddr));
-			if (ret < 0) { 
-      				warn("WARNING: Couldn't connect to ep: %s",
-						ep_name);
-				sockfd = -1;
-				close(sockfd);
+			if (ret < 0 && errno == EINPROGRESS) {
+				/* 
+				 * Couldn't connect right away but will connect in
+				 * future
+				 */
+				struct timeval tv;
+				host_data->ev_connect =
+					event_new(handle->ev_base, sockfd,
+							EV_WRITE, host_connect_cb,
+							host_data);
+				
+				tv.tv_sec = MAX_CONN_TIMEOUT_SEC;
+				tv.tv_usec = 0;
+
+				event_add(host_data->ev_connect, &tv);
+
+				continue;
+
+			} else if (ret < 0){
+				/* Error on connecting. try again */
+				host_try_reconnect(sockfd, host_data);
 				continue;
 			}
 
-			handle->host_data[i][j].bev_write =
-				bufferevent_socket_new(handle->ev_base, sockfd,
-							BEV_OPT_CLOSE_ON_FREE);
-
-			handle->host_data[i][j].is_connected = true;
-			
-			bufferevent_setcb(handle->host_data[i][j].bev_write,
-						host_got_heartbeat,
-						NULL,
-						host_event,
-						&handle->host_data[i][j]);
-
-			bufferevent_enable(handle->host_data[i][j].bev_write,
-						EV_READ | EV_WRITE);
+			host_connected(sockfd, host_data);
 		}
 	}
 
@@ -452,6 +601,23 @@ static int host_init(comm_handle_t *handle)
 	if (ret < 0) {
 		warn("ERROR: Couldn't start a new event handler thread: %d", ret);
 		goto thread_err;
+	}
+
+	/* Wait for all connections to be tried to be connected */
+	for (i = 0; i < NUM_EPS * NUM_SWITCHES; i++) {
+		ret = EINTR;
+		while (ret == EINTR) {
+			ret = sem_wait(&handle->connect_sem);
+		}	
+	}
+
+	pthread_mutex_lock(&handle->lock);
+	num_conn = handle->num_succ_conns;
+	pthread_mutex_unlock(&handle->lock);
+
+	if (num_conn == 0) {
+		warn("ERROR: No connections established");
+		return -1;
 	}
 
 	return 0;

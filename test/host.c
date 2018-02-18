@@ -55,12 +55,14 @@ void parse_inputs(int argc, char **argv)
 int main(int argc, char **argv)
 {
 	comm_handle_t handle;
-	int i;
+	int i, ret;
 	char buf[100];
 	
 	parse_inputs(argc, argv);
 
-	comm_init(&handle, NULL);
+	ret = comm_init(&handle, NULL);
+	if (ret < 0)
+		return ret;
 
 	if (flags.from_stdin) {
 

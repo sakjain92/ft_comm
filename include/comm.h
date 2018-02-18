@@ -10,6 +10,9 @@
 
 #include "list.h"
 
+#include <pthread.h>
+#include <semaphore.h>
+
 /**** Configurable parameters ****/
 
 #define NUM_HOSTS	4
@@ -87,6 +90,7 @@ typedef struct {
 	char buf[MAX_DATA_LEN];
 } comm_data_t;
 
+struct comm_handle;
 
 /* Data kept around in host (per ep) */
 typedef struct {
@@ -95,14 +99,17 @@ typedef struct {
 
 	bool is_connected;
 	int retries_left;
+	struct event *ev_connect;
 	struct bufferevent *bev_write;
+
+	struct comm_handle *handle;
 } host_data_t;
 
 #define HOST_TRIGGER_VAL	"t"
 #define HOST_END_VAL		"e"
 
 /* Handle to the state of comm module */
-typedef struct {
+typedef struct comm_handle {
 	bool is_host;
 
 	struct event_base *ev_base;
@@ -110,12 +117,16 @@ typedef struct {
 	pthread_t host_event_thread;
 	struct bufferevent *host_write;		/* Write to this pipe initiates writes to eps */
 	struct bufferevent *ev_outstanding;	/* Event for incoming data to send out */
+	
 	pthread_mutex_t lock;
 	list_t data_list;			/* Pending data to be sent */
+	int num_succ_conns;			/* Total number of successful conn */
+
 	host_data_t host_data[NUM_EPS][NUM_SWITCHES];
 	int num_msg_sent;
 	int session;
-	
+	sem_t connect_sem;			/* Semaphore to wait for all connections */
+
 	struct event *ev_accept;
 	list_t conn_list;			/* List of all the current connections */
 	comm_ep_callback_t ep_callback;		/* Callback for ep when data arrives */
