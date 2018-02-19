@@ -453,32 +453,6 @@ static void host_connect_terminate_now(host_data_t *host_data)
 }
 
 
-/* Tries to reconnect after failed attempt - Doesn't immedaitely reconnect */
-static bool host_try_reconnect(int sockfd, host_data_t *host_data)
-{
-	if (--host_data->retries_left > 0) {
-
-		struct timeval tv;
-		host_data->ev_connect =
-			event_new(host_data->handle->ev_base, sockfd,
-					0, host_connect_cb,
-					host_data);
-				
-		tv.tv_sec = MAX_CONN_RETRY_TIMEOUT_SEC;
-		tv.tv_usec = 0;
-
-		event_add(host_data->ev_connect, &tv);
-		return true;
-	}
-
-	hostLog(host_data, LOG_WARN, false, "Couldn't connect to ep");
-	host_err(host_data, HOST_CONNECT_FAIL);
-
-	sem_post(&host_data->handle->connect_sem);
-
-	return false;
-}
-
 /* Call this after connection estabished by host with ep */
 static void host_connected(int sockfd, host_data_t *host_data)
 {
@@ -506,6 +480,93 @@ static void host_connected(int sockfd, host_data_t *host_data)
 	sem_post(&host_data->handle->connect_sem);
 }
 
+/* Tries to reconnect after failed attempt - Doesn't immedaitely reconnect */
+static void host_try_connect(host_data_t *host_data)
+{
+	int ret;
+	int sockfd = host_data->connect_fd;
+
+	if (host_data->retries_left > 0) {
+
+		struct hostent *server;
+		struct sockaddr_in serveraddr;
+		int sockfd = host_data->connect_fd;
+		char *ep_name = eps[host_data->ep_num].ip[host_data->ep_sw];
+
+		server = gethostbyname(ep_name);
+		if (server == NULL) {
+			hostLog(host_data, LOG_WARN, false, 
+				"Issue in EPs ipaddr", ep_name);
+			host_err(host_data, HOST_CONNECT_FAIL);
+
+			close(sockfd);
+			return;
+		}
+
+		/* build the server's Internet address */
+		bzero((char *) &serveraddr, sizeof(serveraddr));
+		serveraddr.sin_family = AF_INET;
+		bcopy((char *)server->h_addr, 
+			(char *)&serveraddr.sin_addr.s_addr,
+			server->h_length);
+		serveraddr.sin_port = htons((unsigned short)EP_LISTEN_PORT);
+
+		/* connect: create a connection with the server */
+    		ret = connect(sockfd, (struct sockaddr *)&serveraddr,
+				sizeof(serveraddr));
+		if (ret < 0 && errno == EINPROGRESS) {
+			/* 
+			 * Couldn't connect right away but will connect in
+			 * future
+			 */
+
+			struct timeval tv;
+			host_data->ev_connect =
+				event_new(host_data->handle->ev_base, sockfd,
+						EV_WRITE, host_connect_cb,
+						host_data);
+				
+			tv.tv_sec = MAX_CONN_TIMEOUT_SEC;
+			tv.tv_usec = 0;
+
+			event_add(host_data->ev_connect, &tv);
+
+			return;
+
+		} else if (ret < 0){
+			/* XXX: Check this!! Not sure about this function */
+			/* Error on connecting. try again */
+			struct timeval tv;
+			host_data->ev_connect =
+				event_new(host_data->handle->ev_base, -1,
+						0, host_connect_cb,
+						host_data);
+				
+			tv.tv_sec = MAX_CONN_RETRY_TIMEOUT_SEC;
+			tv.tv_usec = 0;
+
+			event_add(host_data->ev_connect, &tv);
+
+			host_data->retries_left--;
+
+			return;
+		} else {
+			host_connected(sockfd, host_data);
+			return;
+		}
+
+	}
+
+	hostLog(host_data, LOG_WARN, false, "Couldn't connect to ep");
+	host_err(host_data, HOST_CONNECT_FAIL);
+
+	sem_post(&host_data->handle->connect_sem);
+
+	close(sockfd);
+
+	return;
+}
+
 /* Called when finally connect succeeded or timeout */
 static void host_connect_cb(int sockfd, short which, void *arg)
 {
@@ -514,6 +575,8 @@ static void host_connect_cb(int sockfd, short which, void *arg)
 	host_data_t *host_data = (host_data_t *)arg;
 
 	(void)which;
+
+	sockfd = host_data->connect_fd;
 
 	assert(host_data->is_connected == false);
 
@@ -534,7 +597,7 @@ static void host_connect_cb(int sockfd, short which, void *arg)
 		return;
 	} else {
 
-		host_try_reconnect(sockfd, host_data);
+		host_try_connect(host_data);
 		return;
 	}
 	
@@ -592,14 +655,12 @@ static int host_init(comm_handle_t *handle)
 	for (i = 0; i < NUM_EPS; i++) {
 		for (j = 0; j < NUM_SWITCHES; j++) {
 
-			struct hostent *server;
-			struct sockaddr_in serveraddr;
 			int sockfd;
-			char *ep_name = eps[i].ip[j];
-			
+
 			host_data_t *host_data = &handle->host_data[i][j];
 					
-	    		sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	    		host_data->connect_fd = 
+				sockfd = socket(AF_INET, SOCK_STREAM, 0);
     			if (sockfd < 0) {
 				hostLog(host_data, LOG_WARN, true,
 						"Couldn't open socket with ep");
@@ -614,52 +675,9 @@ static int host_init(comm_handle_t *handle)
 				continue;
 			}
 
-			server = gethostbyname(ep_name);
-			if (server == NULL) {
-				hostLog(host_data, LOG_WARN, false, 
-					"Issue in EPs ipaddr", ep_name);
-				host_err(host_data, HOST_CONNECT_FAIL);
+			host_data->connect_fd = sockfd;
 
-				close(sockfd);
-				continue;
-			}
-
-			/* build the server's Internet address */
-			bzero((char *) &serveraddr, sizeof(serveraddr));
-			serveraddr.sin_family = AF_INET;
-			bcopy((char *)server->h_addr, 
-				(char *)&serveraddr.sin_addr.s_addr,
-				server->h_length);
-			serveraddr.sin_port = htons((unsigned short)EP_LISTEN_PORT);
-
-			/* connect: create a connection with the server */
-    			ret = connect(sockfd, (struct sockaddr *)&serveraddr,
-					sizeof(serveraddr));
-			if (ret < 0 && errno == EINPROGRESS) {
-				/* 
-				 * Couldn't connect right away but will connect in
-				 * future
-				 */
-				struct timeval tv;
-				host_data->ev_connect =
-					event_new(handle->ev_base, sockfd,
-							EV_WRITE, host_connect_cb,
-							host_data);
-				
-				tv.tv_sec = MAX_CONN_TIMEOUT_SEC;
-				tv.tv_usec = 0;
-
-				event_add(host_data->ev_connect, &tv);
-
-				continue;
-
-			} else if (ret < 0){
-				/* Error on connecting. try again */
-				host_try_reconnect(sockfd, host_data);
-				continue;
-			}
-
-			host_connected(sockfd, host_data);
+			host_try_connect(host_data);
 		}
 	}
 

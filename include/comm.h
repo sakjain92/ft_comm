@@ -55,7 +55,7 @@
 #define MAX_CONN_TIMEOUT_SEC		5
 
 /* Interval between retrying to connect */
-#define MAX_CONN_RETRY_TIMEOUT_SEC	2
+#define MAX_CONN_RETRY_TIMEOUT_SEC	5
 
 /* Maximum times to try to reconnect */
 #define MAX_CONN_RETRIES		3
@@ -115,6 +115,7 @@ typedef struct {
 	int ep_sw;
 
 	bool is_connected;
+	int connect_fd;
 	int retries_left;
 	struct event *ev_connect;
 	struct bufferevent *bev_write;
