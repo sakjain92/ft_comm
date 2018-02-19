@@ -8,14 +8,14 @@ void callback(int host_num, int host_sw, int session,
 		int msg_num, char *buf, int len)
 {
 	(void)len;
-	printf("EP received from host %d:%d, session: %d, msg_num: %d, msg |%s|\n",
+	printf("Host(%d:%d): Session(%d): MsgNum(%d): Msg(%s)\n",
 		host_num, host_sw, session, msg_num, buf);
 }
 
 /* Error */
 void err_callback(int node_num, int sw, int reason)
 {
-	printf("ERROR_CALLABCK:(%d:%d) ", node_num, sw);
+	printf("ERROR_CALLABCK(%d): HOST(%d:%d) ", reason, node_num, sw);
 
 	switch (reason) {
 	case EP_HEARTBEAT_FAIL:
@@ -38,11 +38,7 @@ int main(void)
 {
 	comm_handle_t handle;
 
-	printf("Endpoint starting\n");
-
 	comm_init(&handle, err_callback, callback);
 	
-	printf("Endpoint ended\n");
-
 	return 0;
 }

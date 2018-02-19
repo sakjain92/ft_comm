@@ -55,7 +55,7 @@ void parse_inputs(int argc, char **argv)
 /* Error */
 void err_callback(int node_num, int sw, int reason)
 {
-	printf("ERROR_CALLABCK:(%d:%d) ", node_num, sw);
+	printf("ERROR_CALLABCK(%d): EP(%d:%d) ", reason, node_num, sw);
 
 	switch (reason) {
 	case HOST_CONNECT_FAIL:
@@ -84,20 +84,32 @@ int main(int argc, char **argv)
 
 	if (flags.from_stdin) {
 
-		char *mbuf;
-		size_t size;
+		char *mbuf = NULL;
+		size_t size = 0;
+		ssize_t ret;
 
-		while (getline(&mbuf, &size, stdin) > 0 && mbuf[size - 1] == '\n') {
-			mbuf[size - 1] = '\0';
-			host_send_msg(&handle, mbuf, size);
+
+		while (1) {
+
+			ret = getline(&mbuf, &size, stdin);
+			
+			if (ret <= 0 || mbuf[ret - 1] != '\n')
+				break;
+	
+			mbuf[ret - 1] = '\0';
 			printf("Message:%s\n", mbuf);
+			host_send_msg(&handle, mbuf, size);
+
+			free(mbuf);
+			mbuf = NULL;
+			size = 0;
 		}
 	} else {
 		for (i = 0; i < flags.count; i++) {
 			sleep(1);
 			sprintf(buf, "%d", i + 1);
-			host_send_msg(&handle, buf, strlen(buf) + 1);
 			printf("Message:%s\n", buf);
+			host_send_msg(&handle, buf, strlen(buf) + 1);
 		}
 	}
 
