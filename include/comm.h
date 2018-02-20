@@ -60,6 +60,12 @@
 /* Maximum times to try to reconnect */
 #define MAX_CONN_RETRIES		3
 
+/* Maximum time during which we wish to receive atleast one heartbeat (in us) */
+#define HOST_HEARTBEAT_DURATION_US	100 * 1000
+
+/* Period in which ep sends heartbeats to host (in us) */
+#define EP_HEARTBEAT_DURATION_US		10 * 1000
+
 /**** End of configurable paramters ****/
 
 /* Error Code */
@@ -119,6 +125,10 @@ typedef struct {
 	int retries_left;
 	struct event *ev_connect;
 	struct bufferevent *bev_write;
+	struct event *heartbeat_check_timer;
+	struct event *heartbeat_req_timer;
+
+	int heartbeats_recv;
 
 	struct comm_handle *handle;
 } host_data_t;

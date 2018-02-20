@@ -242,6 +242,8 @@ func (n *NodeInfo) FilterNodesPackets(otherNode *NodeInfo, sw int, filterType in
 	if filterType == FILTER_INCOMING_DROP || filterType == FILTER_INCOMING_REJECT {
 		fe.cmdS = []string{
 			"INPUT",
+			"-p",
+			"tcp",
 			"--dport",
 			n.ci.port,
 			"-s",
@@ -251,6 +253,8 @@ func (n *NodeInfo) FilterNodesPackets(otherNode *NodeInfo, sw int, filterType in
 	} else {
 		fe.cmdS = []string{
 			"OUTPUT",
+			"-p",
+			"tcp",
 			"--dport",
 			otherNode.ci.port,
 			"-s",

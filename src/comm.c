@@ -205,6 +205,11 @@ static void ep_err(ep_data_t *ep_data, int errType)
 		handle->err_callback(ep_data->host_num,
 					ep_data->host_sw,
 					errType);
+
+	/* Remove connection from the list */
+	list_remove(&ep_data->ep_handle->conn_list, ep_data);
+	bufferevent_free(ep_data->bev);
+	free(ep_data);
 }
 
 /* Used by host to send msg to all the eps */
@@ -365,11 +370,70 @@ static void host_incoming_data(struct bufferevent *bev, void *arg)
 	}	
 }
 
+/* Called periodically to check on heartbeats */
+static void host_check_heartbeat(evutil_socket_t fd, short what, void *arg)
+{
+	host_data_t *host_data = (host_data_t *)arg;
+	(void)what;
+	(void)fd;
+
+	if (host_data->heartbeats_recv == 0) {
+		host_connect_terminate_now(host_data);
+		hostLog(host_data, LOG_WARN, false,
+				"EP connection terminated as no heartbeats");
+		return;
+	}
+
+	host_data->heartbeats_recv = 0;
+}
+
+/* Called periodically to ask EP to send heartbeat */
+static void host_req_heartbeat(evutil_socket_t fd, short what, void *arg)
+{
+	host_data_t *host_data = (host_data_t *)arg;
+	comm_data_t resp_data;
+	size_t len;
+	(void)fd;
+	(void)what;
+
+	resp_data.msg_type = MSG_HEARTBEAT_REQ;
+	resp_data.msg_len = 0;
+
+	len = offsetof(comm_data_t, buf); 
+	if (bufferevent_write(host_data->bev_write,
+				(char *)&resp_data, len) < 0) {
+		hostLog(host_data, LOG_WARN, false,
+					"Couldn't ask for heartbeat");
+		host_connect_terminate_now(host_data);
+	}	
+}
+
 /* Called when host gets heartbeats */
 static void host_got_heartbeat(struct bufferevent *bev, void *arg)
 {
-	(void)bev;
-	(void)arg;
+	host_data_t *host_data = (host_data_t *)arg;
+	ssize_t len, req_len;
+	comm_data_t data;
+
+	req_len = offsetof(comm_data_t, buf);
+	len = bufferevent_read(bev, (char *)&data, 
+				req_len);
+
+	if (len == 0)
+		return;
+
+	if (req_len != len)
+		goto err;
+
+	if (data.msg_type != MSG_HEARTBEAT_RESP)
+		goto err;
+
+	host_data->heartbeats_recv++;
+
+	return;
+err:
+	genericLog(LOG_WARN, false, "Invalid packet data");
+	return;
 }
 
 
@@ -445,6 +509,9 @@ static void host_connect_terminate_now(host_data_t *host_data)
 
 	bufferevent_free(host_data->bev_write);
 
+	event_del(host_data->heartbeat_check_timer);
+	event_del(host_data->heartbeat_req_timer);
+
 	pthread_mutex_lock(&handle->lock);
 	handle->num_succ_conns--;
 	pthread_mutex_unlock(&handle->lock);
@@ -456,6 +523,9 @@ static void host_connect_terminate_now(host_data_t *host_data)
 /* Call this after connection estabished by host with ep */
 static void host_connected(int sockfd, host_data_t *host_data)
 {
+	struct timeval heartbeat_check_time = { 0, HOST_HEARTBEAT_DURATION_US };
+	struct timeval heartbeat_req_time = { 0, EP_HEARTBEAT_DURATION_US };
+
 	comm_handle_t *handle = host_data->handle;
 
 	host_data->bev_write =
@@ -472,6 +542,18 @@ static void host_connected(int sockfd, host_data_t *host_data)
 
 	bufferevent_enable(host_data->bev_write,
 				EV_READ | EV_WRITE);
+
+	/* Checker for periodic heartbeat */
+	host_data->heartbeat_check_timer = event_new(handle->ev_base, -1, EV_PERSIST,
+			host_check_heartbeat, host_data);
+
+	event_add(host_data->heartbeat_check_timer, &heartbeat_check_time);
+
+	/* Request periodic heartbeat */
+	host_data->heartbeat_req_timer = event_new(handle->ev_base, -1, EV_PERSIST,
+			host_req_heartbeat, host_data);
+
+	event_add(host_data->heartbeat_req_timer, &heartbeat_req_time);
 
 	pthread_mutex_lock(&handle->lock);
 	handle->num_succ_conns++;
@@ -647,6 +729,7 @@ static int host_init(comm_handle_t *handle)
 			host_data->is_connected = false;
 			host_data->retries_left = MAX_CONN_RETRIES;
 			host_data->ev_connect = NULL;
+			host_data->heartbeats_recv = 0;
 			host_data->handle = handle;
 		}
 	}
@@ -740,6 +823,7 @@ sock_err:
 void ep_event(struct bufferevent *bev, short event, void *arg)
 {
 	ep_data_t *ep_data = (ep_data_t *)arg;
+	(void)bev;
 
     	if (event & BEV_EVENT_EOF) {
 		/* Host disconnected */
@@ -757,18 +841,13 @@ void ep_event(struct bufferevent *bev, short event, void *arg)
 	} 
 
 	ep_err(ep_data, EP_CONNECT_TERMINATE);
-
-	/* Remove connection from the list */
-	list_remove(&ep_data->ep_handle->conn_list, ep_data);
-	bufferevent_free(bev);
-	free(ep_data);
 	return;
 }
 
 /*
  * This function will be called by libevent after heartbeat is sent to host
  */
-void ep_write(struct bufferevent *bev, void *arg)
+static void ep_write(struct bufferevent *bev, void *arg)
 {
 	(void)bev;
 	(void)arg;
@@ -778,7 +857,7 @@ void ep_write(struct bufferevent *bev, void *arg)
  * This function will be called by libevent when there is a pending data to
  * be read by end point on existing connection
  */
-void ep_read(struct bufferevent *bev, void *arg)
+static void ep_read(struct bufferevent *bev, void *arg)
 {
 	ep_data_t *ep_data = (ep_data_t *)arg;
 	comm_handle_t *handle = ep_data->ep_handle;
@@ -878,10 +957,6 @@ void ep_read(struct bufferevent *bev, void *arg)
 err:
 	genericLog(LOG_WARN, false, "Invalid packet data");
 	ep_err(ep_data, EP_INVALID_MSG);
-
-	list_remove(&ep_data->ep_handle->conn_list, ep_data);
-	bufferevent_free(bev);
-	free(ep_data);
 	return;
 }
 

@@ -82,6 +82,8 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		return ret;
 
+	printf("Host started\n");
+
 	if (flags.from_stdin) {
 
 		char *mbuf = NULL;
